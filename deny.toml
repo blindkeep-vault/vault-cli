@@ -1,0 +1,19 @@
+[advisories]
+
+[licenses]
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+
+[sources]
+allow-git = [
+    "https://github.com/blindkeep-vault/vault-core",
+    "ssh://git@github.com/blindkeep-vault/vault-core.git",
+]
