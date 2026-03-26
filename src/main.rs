@@ -6,9 +6,10 @@ use clap::{Parser, Subcommand};
 use hkdf::Hkdf;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
+use rand::RngCore;
 use sha2::{Digest, Sha256, Sha512};
 use std::path::PathBuf;
-use vault_core::crypto::decrypt_item;
+use vault_core::crypto::{decrypt_item, encrypt_item};
 
 #[derive(Parser)]
 #[command(
@@ -45,6 +46,11 @@ enum Command {
         key2: Option<String>,
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// Encrypt and upload a file as an anonymous drop
+    Drop {
+        /// File to encrypt and upload
+        file: PathBuf,
     },
     /// Notarize a file or hash
     Notarize {
@@ -93,6 +99,9 @@ fn main() {
     match cli.command {
         Some(Command::Download { key, key2, output }) => {
             run_drop_download(&client, &cli.api_url, &key, key2.as_deref(), output);
+        }
+        Some(Command::Drop { file }) => {
+            run_drop_upload(&client, &cli.api_url, &file);
         }
         Some(Command::Notarize {
             input,
@@ -374,8 +383,9 @@ fn run_drop_download(
                 .map(|v: &serde_json::Value| v.as_u64().unwrap() as u8)
                 .collect();
 
-            eprintln!("Deriving wrapping key...");
-            let wrapping_key = derive_drop_wrapping_key(&mnemonic);
+            let version = drop_meta["drop_key_version"].as_i64().unwrap_or(1) as i32;
+            eprintln!("Deriving wrapping key (v{})...", version);
+            let wrapping_key = derive_drop_wrapping_key(&mnemonic, version);
             let drop_key = unwrap_drop_key(&wrapping_key, &wrapped_bytes);
 
             download_drop(client, api_url, &resolved_id, &drop_key, output);
@@ -618,10 +628,19 @@ fn derive_drop_lookup_key(mnemonic: &str) -> String {
     hex::encode(out)
 }
 
-fn derive_drop_wrapping_key(mnemonic: &str) -> [u8; 32] {
+fn derive_drop_wrapping_key(mnemonic: &str, version: i32) -> [u8; 32] {
+    let iterations = if version >= 2 { 600_000 } else { 2048 };
     let mut out = [0u8; 32];
-    pbkdf2::<Hmac<Sha512>>(mnemonic.as_bytes(), b"vault-drop", 2048, &mut out)
+    pbkdf2::<Hmac<Sha512>>(mnemonic.as_bytes(), b"vault-drop", iterations, &mut out)
         .expect("PBKDF2 failed");
+    out
+}
+
+fn wrap_drop_key(wrapping_key: &[u8; 32], drop_key: &[u8; 32]) -> Vec<u8> {
+    let enc = encrypt_item(wrapping_key, drop_key).expect("wrap failed");
+    let mut out = Vec::with_capacity(24 + enc.ciphertext.len());
+    out.extend_from_slice(&enc.nonce);
+    out.extend_from_slice(&enc.ciphertext);
     out
 }
 
@@ -642,4 +661,195 @@ fn unwrap_drop_key(wrapping_key: &[u8; 32], wrapped: &[u8]) -> [u8; 32] {
     }
     let bytes: [u8; 32] = plain.as_slice().try_into().unwrap();
     bytes
+}
+
+fn padded_size(actual: usize) -> usize {
+    let total = 4 + actual;
+    if total <= 1024 {
+        return 1024;
+    }
+    if total <= 16384 {
+        let mut s = 1024;
+        while s < total {
+            s *= 2;
+        }
+        return s;
+    }
+    if total <= 1_048_576 {
+        return total.div_ceil(65536) * 65536;
+    }
+    if total <= 67_108_864 {
+        return total.div_ceil(1_048_576) * 1_048_576;
+    }
+    total.div_ceil(8_388_608) * 8_388_608
+}
+
+fn pad_plaintext(data: &[u8]) -> Vec<u8> {
+    let target = padded_size(data.len());
+    let mut result = vec![0u8; target];
+    let len = data.len() as u32;
+    result[..4].copy_from_slice(&len.to_be_bytes());
+    result[4..4 + data.len()].copy_from_slice(data);
+    // Fill padding with random bytes
+    if target > 4 + data.len() {
+        rand::rngs::OsRng.fill_bytes(&mut result[4 + data.len()..]);
+    }
+    result
+}
+
+fn generate_bip39_mnemonic() -> String {
+    use bip39::Mnemonic;
+    let mut entropy = [0u8; 16]; // 128 bits → 12 words
+    rand::rngs::OsRng.fill_bytes(&mut entropy);
+    let mnemonic = Mnemonic::from_entropy(&entropy).expect("mnemonic generation failed");
+    mnemonic.to_string()
+}
+
+fn run_drop_upload(client: &reqwest::blocking::Client, api_url: &str, file_path: &std::path::Path) {
+    if !file_path.exists() {
+        eprintln!("error: file not found: {}", file_path.display());
+        std::process::exit(1);
+    }
+
+    let file_data = std::fs::read(file_path).unwrap_or_else(|e| {
+        eprintln!("error reading {}: {}", file_path.display(), e);
+        std::process::exit(1);
+    });
+
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+
+    let mime_type = mime_guess::from_path(file_path)
+        .first_or_octet_stream()
+        .to_string();
+
+    // Build envelope: [4-byte header_len][JSON metadata][file bytes]
+    let meta = serde_json::json!({
+        "name": file_name,
+        "type": mime_type,
+        "size": file_data.len(),
+    });
+    let meta_bytes = meta.to_string().into_bytes();
+    let header_len = meta_bytes.len() as u32;
+
+    let mut envelope = Vec::with_capacity(4 + meta_bytes.len() + file_data.len());
+    envelope.extend_from_slice(&header_len.to_be_bytes());
+    envelope.extend_from_slice(&meta_bytes);
+    envelope.extend_from_slice(&file_data);
+
+    // Pad plaintext to hide exact file size
+    let padded = pad_plaintext(&envelope);
+
+    // Generate random drop key and encrypt
+    eprintln!("Encrypting {}...", file_name);
+    let mut drop_key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut drop_key);
+
+    let enc = encrypt_item(&drop_key, &padded).expect("encryption failed");
+
+    // Build blob: nonce(24) + ciphertext
+    let mut blob = Vec::with_capacity(24 + enc.ciphertext.len());
+    blob.extend_from_slice(&enc.nonce);
+    blob.extend_from_slice(&enc.ciphertext);
+
+    // Generate BIP39 mnemonic and derive keys
+    let mnemonic = generate_bip39_mnemonic();
+    let lookup_key = derive_drop_lookup_key(&mnemonic);
+
+    eprintln!("Deriving wrapping key...");
+    let wrapping_key = derive_drop_wrapping_key(&mnemonic, 2);
+    let wrapped_drop_key = wrap_drop_key(&wrapping_key, &drop_key);
+
+    // Get presigned upload URL
+    eprintln!("Uploading ({} bytes)...", blob.len());
+    let url_resp: serde_json::Value = client
+        .post(format!("{}/drops/upload-url", api_url))
+        .json(&serde_json::json!({ "size_bytes": blob.len() }))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to get upload URL: {}", e);
+            std::process::exit(1);
+        })
+        .json()
+        .unwrap_or_else(|e| {
+            eprintln!("error: invalid upload-url response: {}", e);
+            std::process::exit(1);
+        });
+
+    let upload_url = url_resp["upload_url"].as_str().unwrap_or_else(|| {
+        eprintln!("error: missing upload_url in response");
+        std::process::exit(1);
+    });
+    let s3_key = url_resp["s3_key"].as_str().unwrap_or_else(|| {
+        eprintln!("error: missing s3_key in response");
+        std::process::exit(1);
+    });
+
+    // Upload blob to S3
+    let put_resp = client
+        .put(upload_url)
+        .body(blob.clone())
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: upload failed: {}", e);
+            std::process::exit(1);
+        });
+    if !put_resp.status().is_success() {
+        eprintln!("error: upload failed ({})", put_resp.status());
+        std::process::exit(1);
+    }
+
+    // Create drop record
+    let nonce_array: Vec<u8> = enc.nonce.to_vec();
+    let wrapped_array: Vec<u8> = wrapped_drop_key;
+
+    let drop_resp: serde_json::Value = client
+        .post(format!("{}/drops", api_url))
+        .json(&serde_json::json!({
+            "s3_key": s3_key,
+            "size_bytes": blob.len(),
+            "nonce": nonce_array,
+            "wrapped_drop_key": wrapped_array,
+            "lookup_key": lookup_key,
+            "drop_key_version": 2,
+        }))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to create drop: {}", e);
+            std::process::exit(1);
+        })
+        .json()
+        .unwrap_or_else(|e| {
+            eprintln!("error: invalid drop response: {}", e);
+            std::process::exit(1);
+        });
+
+    let drop_id = drop_resp["id"].as_str().unwrap_or("?");
+    let expires_at = drop_resp["expires_at"].as_str().unwrap_or("?");
+
+    // Build pickup URL with mnemonic slug
+    let slug = mnemonic.split_whitespace().collect::<Vec<_>>().join("-");
+    let pickup_url = format!("{}/pickup/{}", api_url.trim_end_matches('/'), slug);
+
+    eprintln!();
+    eprintln!("Drop created successfully!");
+    eprintln!("Drop ID:    {}", drop_id);
+    eprintln!("Expires at: {}", expires_at);
+    eprintln!();
+    eprintln!("Pickup URL: {}", pickup_url);
+    eprintln!();
+    eprintln!("Passphrase (12 words):");
+    let words: Vec<&str> = mnemonic.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        eprint!("  {:>2}. {:<12}", i + 1, word);
+        if (i + 1) % 4 == 0 {
+            eprintln!();
+        }
+    }
+    eprintln!();
+    eprintln!("Share the pickup URL or the 12 words with the recipient.");
+    eprintln!("The passphrase is embedded in the URL — sharing just the URL is enough.");
 }
