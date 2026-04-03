@@ -21,4 +21,7 @@ chrono = "0.4"
 bip39 = "2"
 rand = "0.8"
 mime_guess = "2"
+rpassword = "7"
+dirs = "5"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 

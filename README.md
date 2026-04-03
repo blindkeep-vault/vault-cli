@@ -92,6 +92,119 @@ vault-cli verify notarization-abcd1234.json document.pdf
 vault-cli notarizations --token $VAULT_TOKEN
 ```
 
+### Secrets
+
+```bash
+# Store a secret
+vault-cli put prod/db-password "hunter2"
+
+# Read from stdin
+echo -n "hunter2" | vault-cli put prod/db-password
+
+# Read from file
+vault-cli put prod/tls-cert @cert.pem
+
+# Retrieve a secret
+vault-cli get prod/db-password
+
+# List secrets
+vault-cli ls
+vault-cli ls prod/
+
+# Delete a secret
+vault-cli rm prod/db-password
+```
+
+### Environment files
+
+Store an entire `.env` file as a single encrypted vault item and inject it in CI.
+
+```bash
+# Push a .env file to the vault
+vault-cli env push myapp/prod .env.prod
+
+# Push from stdin
+cat .env | vault-cli env push myapp/prod -
+
+# Pull it back
+vault-cli env pull myapp/prod
+vault-cli env pull myapp/prod -o .env.local
+
+# Inject variables and run a command (CI usage)
+vault-cli env run myapp/prod -- ./deploy.sh
+
+# Inject into the current shell
+eval $(vault-cli env export myapp/prod)
+```
+
+The `push` command is idempotent — if an env file with the same label already exists, it is replaced.
+
+#### CI/CD example (GitHub Actions)
+
+```yaml
+env:
+  VAULT_API_KEY: ${{ secrets.VAULT_API_KEY }}
+  VAULT_API_URL: https://blindkeep.com
+
+steps:
+  - name: Install vault-cli
+    run: cargo install --git ssh://git@github.com/blindkeep-vault/vault-cli.git
+
+  - name: Deploy with secrets
+    run: vault-cli env run myapp/prod -- ./deploy.sh
+```
+
+### Prefix-based secret injection
+
+Inject individual secrets matching a label prefix as environment variables into a child process. Labels are converted to env var names: strip prefix, uppercase, replace `/` and `-` with `_`.
+
+```bash
+# Store individual secrets
+vault-cli put prod/db-url "postgres://..."
+vault-cli put prod/api-key "sk-..."
+
+# Inject all prod/ secrets and run a command
+# prod/db-url → DB_URL, prod/api-key → API_KEY
+vault-cli env inject prod/ -- ./deploy.sh
+```
+
+### API keys
+
+```bash
+# Create an API key (shown once)
+vault-cli apikey create "CI prod"
+
+# Create a scoped, read-only key
+vault-cli apikey create "CI readonly" --scoped --read-only
+
+# List keys
+vault-cli apikey list
+
+# Revoke a key
+vault-cli apikey revoke <id>
+
+# Grant an item to a scoped key
+vault-cli apikey grant <key-id> prod/db-password
+
+# List grants
+vault-cli apikey grants <key-id>
+```
+
+### Authentication
+
+```bash
+vault-cli login           # Interactive email + password login
+vault-cli logout          # Clear session
+vault-cli status          # Show auth state
+```
+
+Or use an API key via environment variable:
+
+```bash
+export VAULT_API_KEY=vk_...
+vault-cli get prod/db-password
+```
+
 ## Options
 
 | Flag | Env var | Default | Description |
