@@ -418,10 +418,7 @@ fn prompt_line(prompt: &str) -> String {
     line.trim().to_string()
 }
 
-fn get_auth(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-) -> AuthContext {
+fn get_auth(client: &reqwest::blocking::Client, api_url: &str) -> AuthContext {
     // Priority 1: VAULT_API_KEY env var
     if let Ok(api_key) = std::env::var("VAULT_API_KEY") {
         return auth_with_api_key(client, api_url, &api_key);
@@ -510,8 +507,8 @@ fn auth_with_api_key(
     if has_public_key && !has_wrapped_master_key {
         // Scoped key: unwrap the API key's own private key
         let encrypted_private_key = json_to_bytes(&body["encrypted_private_key"]);
-        let api_privkey_mk =
-            unwrap_master_key(&wrapping_key, &encrypted_private_key).unwrap_or_else(|e| {
+        let api_privkey_mk = unwrap_master_key(&wrapping_key, &encrypted_private_key)
+            .unwrap_or_else(|e| {
                 eprintln!("error: failed to unwrap API key private key: {}", e);
                 std::process::exit(1);
             });
@@ -649,7 +646,14 @@ fn run_apikey(client: &reqwest::blocking::Client, api_url: &str, action: ApikeyA
             read_only,
             scoped,
             expires,
-        } => run_apikey_create(client, api_url, &name, read_only, scoped, expires.as_deref()),
+        } => run_apikey_create(
+            client,
+            api_url,
+            &name,
+            read_only,
+            scoped,
+            expires.as_deref(),
+        ),
         ApikeyAction::List => run_apikey_list(client, api_url),
         ApikeyAction::Revoke { id } => run_apikey_revoke(client, api_url, &id),
         ApikeyAction::Grant { key_id, label } => run_apikey_grant(client, api_url, &key_id, &label),
@@ -692,8 +696,8 @@ fn run_apikey_create(
         // Scoped key: generate X25519 keypair, wrap private key with API wrapping key
         eprintln!("Generating scoped API key...");
         let (privkey, pubkey) = generate_x25519_keypair();
-        let wrapped_privkey =
-            wrap_master_key(&wrapping_key, &MasterKey::from_bytes(privkey)).unwrap_or_else(|e| {
+        let wrapped_privkey = wrap_master_key(&wrapping_key, &MasterKey::from_bytes(privkey))
+            .unwrap_or_else(|e| {
                 eprintln!("error wrapping private key: {}", e);
                 std::process::exit(1);
             });
@@ -702,8 +706,8 @@ fn run_apikey_create(
         // Full-access key: wrap user's master key
         let password = prompt_password("Password (to wrap master key): ");
         eprintln!("Deriving master key...");
-        let master_key =
-            derive_master_key(password.as_bytes(), &session.client_salt).unwrap_or_else(|e| {
+        let master_key = derive_master_key(password.as_bytes(), &session.client_salt)
+            .unwrap_or_else(|e| {
                 eprintln!("error: key derivation failed: {}", e);
                 std::process::exit(1);
             });
@@ -805,7 +809,10 @@ fn parse_duration(s: &str) -> chrono::Duration {
     } else if let Some(years) = s.strip_suffix('y') {
         chrono::Duration::days(years.parse::<i64>().expect("invalid number of years") * 365)
     } else {
-        eprintln!("error: invalid expiry format '{}' (use e.g. '30d' or '1y')", s);
+        eprintln!(
+            "error: invalid expiry format '{}' (use e.g. '30d' or '1y')",
+            s
+        );
         std::process::exit(1);
     }
 }
@@ -887,12 +894,7 @@ fn run_apikey_revoke(client: &reqwest::blocking::Client, api_url: &str, id: &str
     eprintln!("API key revoked.");
 }
 
-fn run_apikey_grant(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    key_id: &str,
-    label: &str,
-) {
+fn run_apikey_grant(client: &reqwest::blocking::Client, api_url: &str, key_id: &str, label: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
@@ -1241,7 +1243,11 @@ fn fetch_secrets_full(
         item_key.copy_from_slice(&item_key_plain);
 
         if let Some(blob) = decrypt_item_blob(client, api_url, jwt, &item_id, &item_key) {
-            secrets.push((item_id, blob, serde_json::to_string(item).unwrap_or_default()));
+            secrets.push((
+                item_id,
+                blob,
+                serde_json::to_string(item).unwrap_or_default(),
+            ));
         }
     }
 
@@ -1300,12 +1306,7 @@ fn fetch_secrets_scoped(
     secrets
 }
 
-fn run_put(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    label: &str,
-    value: Option<&str>,
-) {
+fn run_put(client: &reqwest::blocking::Client, api_url: &str, label: &str, value: Option<&str>) {
     let auth = get_auth(client, api_url);
 
     let secret_value = match value {
@@ -1420,11 +1421,7 @@ fn run_get(
     }
 }
 
-fn run_ls(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    prefix: Option<&str>,
-) {
+fn run_ls(client: &reqwest::blocking::Client, api_url: &str, prefix: Option<&str>) {
     let auth = get_auth(client, api_url);
     let secrets = fetch_and_decrypt_secrets(client, &auth);
 
@@ -1549,18 +1546,15 @@ fn find_envfile<'a>(
         .find(|(_, blob, _)| blob.label == label && blob.item_type == "envfile")
 }
 
-fn run_env_push(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    label: &str,
-    file: &str,
-) {
+fn run_env_push(client: &reqwest::blocking::Client, api_url: &str, label: &str, file: &str) {
     let content = if file == "-" {
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
-            eprintln!("error reading stdin: {}", e);
-            std::process::exit(1);
-        });
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .unwrap_or_else(|e| {
+                eprintln!("error reading stdin: {}", e);
+                std::process::exit(1);
+            });
         buf
     } else {
         std::fs::read_to_string(file).unwrap_or_else(|e| {
@@ -1571,7 +1565,11 @@ fn run_env_push(
 
     // Validate the .env content parses correctly
     let vars = parse_dotenv(&content);
-    eprintln!("Parsed {} variables from {}", vars.len(), if file == "-" { "stdin" } else { file });
+    eprintln!(
+        "Parsed {} variables from {}",
+        vars.len(),
+        if file == "-" { "stdin" } else { file }
+    );
 
     let auth = get_auth(client, api_url);
 
@@ -1682,12 +1680,7 @@ fn run_env_pull(
     }
 }
 
-fn run_env_run(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    label: &str,
-    cmd: &[String],
-) {
+fn run_env_run(client: &reqwest::blocking::Client, api_url: &str, label: &str, cmd: &[String]) {
     if cmd.is_empty() {
         eprintln!("error: no command specified");
         std::process::exit(1);
@@ -1720,11 +1713,7 @@ fn run_env_run(
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn run_env_export(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    label: &str,
-) {
+fn run_env_export(client: &reqwest::blocking::Client, api_url: &str, label: &str) {
     let auth = get_auth(client, api_url);
     let secrets = fetch_and_decrypt_secrets(client, &auth);
 
@@ -1745,12 +1734,7 @@ fn run_env_export(
     }
 }
 
-fn run_env(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    prefix: &str,
-    cmd: &[String],
-) {
+fn run_env(client: &reqwest::blocking::Client, api_url: &str, prefix: &str, cmd: &[String]) {
     if cmd.is_empty() {
         eprintln!("error: no command specified");
         std::process::exit(1);
