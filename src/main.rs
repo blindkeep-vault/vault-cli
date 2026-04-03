@@ -845,8 +845,8 @@ fn run_apikey_list(client: &reqwest::blocking::Client, api_url: &str) {
     }
 
     println!(
-        "{:<38} {:<20} {:<14} {:<10} {}",
-        "ID", "NAME", "PREFIX", "SCOPE", "LAST USED"
+        "{:<38} {:<20} {:<14} {:<10} LAST USED",
+        "ID", "NAME", "PREFIX", "SCOPE"
     );
     println!("{}", "-".repeat(95));
     for k in &keys {
@@ -1043,7 +1043,7 @@ fn run_apikey_grants(client: &reqwest::blocking::Client, api_url: &str, key_id: 
         return;
     }
 
-    println!("{:<38} {:<38} {}", "GRANT ID", "ITEM ID", "CREATED");
+    println!("{:<38} {:<38} CREATED", "GRANT ID", "ITEM ID");
     println!("{}", "-".repeat(90));
     for g in &grants {
         println!(
@@ -1495,9 +1495,9 @@ fn parse_dotenv(content: &str) -> Vec<(String, String)> {
         let key = trimmed[..eq_pos].trim().to_string();
         let raw_value = &trimmed[eq_pos + 1..];
 
-        let value = if raw_value.starts_with('"') {
+        let value = if let Some(dq_inner) = raw_value.strip_prefix('"') {
             // Double-quoted: handle escapes, may span multiple lines
-            let mut buf = raw_value[1..].to_string();
+            let mut buf = dq_inner.to_string();
             while !buf.ends_with('"') || buf.ends_with("\\\"") {
                 if let Some(next_line) = lines.next() {
                     buf.push('\n');
@@ -1514,9 +1514,9 @@ fn parse_dotenv(content: &str) -> Vec<(String, String)> {
             buf.replace("\\n", "\n")
                 .replace("\\\"", "\"")
                 .replace("\\\\", "\\")
-        } else if raw_value.starts_with('\'') {
+        } else if let Some(sq_inner) = raw_value.strip_prefix('\'') {
             // Single-quoted: literal, no escapes
-            let inner = raw_value[1..].strip_suffix('\'').unwrap_or(&raw_value[1..]);
+            let inner = sq_inner.strip_suffix('\'').unwrap_or(sq_inner);
             inner.to_string()
         } else {
             // Unquoted: strip inline comments
@@ -1752,8 +1752,7 @@ fn run_env(client: &reqwest::blocking::Client, api_url: &str, prefix: &str, cmd:
     for (_, blob, _) in &matching {
         let name = blob.label[prefix.len()..]
             .to_uppercase()
-            .replace('/', "_")
-            .replace('-', "_");
+            .replace(['/', '-'], "_");
         if name.is_empty() {
             continue;
         }
