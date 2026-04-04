@@ -169,6 +169,11 @@ enum ApikeyAction {
         /// Item label to revoke
         label: String,
     },
+    /// Rotate an API key (create new, copy grants, revoke old)
+    Rotate {
+        /// API key ID or prefix to rotate
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -661,6 +666,7 @@ fn run_apikey(client: &reqwest::blocking::Client, api_url: &str, action: ApikeyA
         ApikeyAction::Ungrant { key_id, label } => {
             run_apikey_ungrant(client, api_url, &key_id, &label)
         }
+        ApikeyAction::Rotate { key } => run_apikey_rotate(client, api_url, &key),
     }
 }
 
@@ -1130,6 +1136,270 @@ fn run_apikey_ungrant(
     }
 
     eprintln!("Revoked '{}' from API key {}.", label, key_id);
+}
+
+fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_ref: &str) {
+    let session = load_session().unwrap_or_else(|| {
+        eprintln!("error: not logged in. Run `vault-cli login` first");
+        std::process::exit(1);
+    });
+
+    // Find the key to rotate by ID or prefix
+    let keys_resp = client
+        .get(format!("{}/api-keys", api_url))
+        .header("Authorization", format!("Bearer {}", session.jwt))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+    if !keys_resp.status().is_success() {
+        eprintln!("error: failed to list API keys");
+        std::process::exit(1);
+    }
+    let keys: Vec<serde_json::Value> = keys_resp.json().expect("invalid JSON");
+    let old_key = keys
+        .iter()
+        .find(|k| k["id"].as_str() == Some(key_ref) || k["key_prefix"].as_str() == Some(key_ref))
+        .unwrap_or_else(|| {
+            eprintln!("error: API key '{}' not found", key_ref);
+            std::process::exit(1);
+        });
+
+    let old_id = old_key["id"].as_str().unwrap().to_string();
+    let old_name = old_key["name"].as_str().unwrap_or("").to_string();
+    let old_scopes = old_key["scopes"].clone();
+    let is_scoped = old_key["is_scoped"].as_bool() == Some(true);
+
+    eprintln!("Rotating API key: {} ({})", old_name, old_id);
+
+    // Generate new secret
+    let mut secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+
+    let (wrapping_key, auth_key) = derive_api_key_keys(&secret).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+
+    let key_prefix = format!("vk_{}", hex::encode(&secret[..4]));
+
+    struct KeyMaterial {
+        wrapped_master_key: Option<Vec<u8>>,
+        encrypted_private_key: Vec<u8>,
+        public_key: Option<Vec<u8>>,
+        new_privkey: Option<[u8; 32]>,
+    }
+
+    let km = if is_scoped {
+        let (privkey, pubkey) = generate_x25519_keypair();
+        let wrapped_privkey = wrap_master_key(&wrapping_key, &MasterKey::from_bytes(privkey))
+            .unwrap_or_else(|e| {
+                eprintln!("error wrapping private key: {}", e);
+                std::process::exit(1);
+            });
+        KeyMaterial {
+            wrapped_master_key: None,
+            encrypted_private_key: wrapped_privkey,
+            public_key: Some(pubkey.to_vec()),
+            new_privkey: Some(privkey),
+        }
+    } else {
+        let password = prompt_password("Password (to wrap master key): ");
+        eprintln!("Deriving master key...");
+        let master_key = derive_master_key(password.as_bytes(), &session.client_salt)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
+
+        let wmk = wrap_master_key(&wrapping_key, &master_key).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+        let me_resp = client
+            .get(format!("{}/auth/me", api_url))
+            .header("Authorization", format!("Bearer {}", session.jwt))
+            .send()
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
+        if !me_resp.status().is_success() {
+            eprintln!("error: session expired. Run `vault-cli login` again");
+            std::process::exit(1);
+        }
+        let me: serde_json::Value = me_resp.json().expect("invalid JSON");
+        let epk = json_to_bytes(&me["encrypted_private_key"]);
+
+        KeyMaterial {
+            wrapped_master_key: Some(wmk),
+            encrypted_private_key: epk,
+            public_key: None,
+            new_privkey: None,
+        }
+    };
+
+    let new_name = format!("{} (rotated)", old_name);
+
+    let mut body = serde_json::json!({
+        "name": new_name,
+        "auth_key": hex::encode(auth_key),
+        "key_prefix": key_prefix,
+        "encrypted_private_key": km.encrypted_private_key,
+        "scopes": old_scopes,
+    });
+    if let Some(wmk) = &km.wrapped_master_key {
+        body["wrapped_master_key"] = serde_json::json!(wmk);
+    }
+    if let Some(pk) = &km.public_key {
+        body["public_key"] = serde_json::json!(pk);
+    }
+
+    let resp = client
+        .post(format!("{}/api-keys", api_url))
+        .header("Authorization", format!("Bearer {}", session.jwt))
+        .json(&body)
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: failed to create new API key: {}", text);
+        std::process::exit(1);
+    }
+
+    let new_key_resp: serde_json::Value = resp.json().expect("invalid JSON");
+    let new_id = new_key_resp["id"].as_str().unwrap().to_string();
+
+    // Re-grant items if scoped
+    if is_scoped {
+        let new_pubkey_bytes = json_to_bytes(&new_key_resp["public_key"]);
+        let mut new_pubkey = [0u8; 32];
+        new_pubkey.copy_from_slice(&new_pubkey_bytes);
+
+        // Get old key's private key to unwrap grants
+        // We need the old API key's private key. The user doesn't have the old secret anymore
+        // if they're rotating, so we need the master key to re-wrap from source items.
+        let password = if km.new_privkey.is_some() {
+            // Already prompted for scoped path — need master key for item access
+            prompt_password("Password (to re-grant items): ")
+        } else {
+            unreachable!()
+        };
+        let master_key = derive_master_key(password.as_bytes(), &session.client_salt)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
+        let enc_key = derive_subkey(&master_key, b"encrypt").unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+        let grants_resp = client
+            .get(format!("{}/api-keys/{}/grants", api_url, old_id))
+            .header("Authorization", format!("Bearer {}", session.jwt))
+            .send()
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            });
+        if grants_resp.status().is_success() {
+            let grants: Vec<serde_json::Value> = grants_resp.json().expect("invalid JSON");
+            for grant in &grants {
+                let item_id = grant["item_id"].as_str().unwrap_or("");
+
+                // Fetch item to get wrapped_key + nonce
+                let item_resp = client
+                    .get(format!("{}/items/{}", api_url, item_id))
+                    .header("Authorization", format!("Bearer {}", session.jwt))
+                    .send();
+                let item: serde_json::Value = match item_resp {
+                    Ok(r) if r.status().is_success() => r.json().unwrap_or_default(),
+                    _ => {
+                        eprintln!("warning: could not fetch item {}, skipping grant", item_id);
+                        continue;
+                    }
+                };
+
+                let wrapped_key = json_to_bytes(&item["wrapped_key"]);
+                let nonce = json_to_bytes(&item["nonce"]);
+
+                let item_key_plain = match decrypt_item(&enc_key, &wrapped_key, &nonce) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("warning: could not decrypt item key for {}: {}", item_id, e);
+                        continue;
+                    }
+                };
+                let mut item_key = [0u8; 32];
+                item_key.copy_from_slice(&item_key_plain);
+
+                // Wrap for new API key's public key
+                let grant_wrap =
+                    wrap_key_for_recipient(&item_key, &new_pubkey).unwrap_or_else(|e| {
+                        eprintln!("error wrapping key for grant: {}", e);
+                        std::process::exit(1);
+                    });
+
+                let resp = client
+                    .post(format!("{}/api-keys/{}/grants", api_url, new_id))
+                    .header("Authorization", format!("Bearer {}", session.jwt))
+                    .json(&serde_json::json!({
+                        "item_id": item_id,
+                        "wrapped_key": grant_wrap.wrapped_key,
+                        "ephemeral_pubkey": grant_wrap.ephemeral_pubkey.to_vec(),
+                        "nonce": grant_wrap.nonce.to_vec(),
+                    }))
+                    .send();
+
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        eprintln!("  Re-granted item {}", item_id);
+                    }
+                    _ => {
+                        eprintln!("warning: failed to re-grant item {}", item_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Revoke old key
+    let resp = client
+        .delete(format!("{}/api-keys/{}", api_url, old_id))
+        .header("Authorization", format!("Bearer {}", session.jwt))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        eprintln!(
+            "warning: new key created but failed to revoke old key {}",
+            old_id
+        );
+    }
+
+    let display_key = format!(
+        "vk_{}_{}",
+        hex::encode(&secret[..4]),
+        URL_SAFE_NO_PAD.encode(secret)
+    );
+
+    eprintln!();
+    eprintln!("Rotated: {} -> {}", old_id, new_id);
+    eprintln!("New key (shown once — store it securely):");
+    eprintln!();
+    println!("{}", display_key);
+    eprintln!();
+    eprintln!("Usage: export VAULT_API_KEY={}", display_key);
 }
 
 // --- Secret CRUD ---
