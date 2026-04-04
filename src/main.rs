@@ -1906,8 +1906,14 @@ fn run_verify(certificate_path: &std::path::Path, document: Option<&std::path::P
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&signature);
 
-        if vault_core::crypto::verify_notarization_signature(&pk, &ch, None, timestamp_millis, &tr, &sig)
-        {
+        if vault_core::crypto::verify_notarization_signature(
+            &pk,
+            &ch,
+            None,
+            timestamp_millis,
+            &tr,
+            &sig,
+        ) {
             eprintln!("[PASS] Ed25519 signature valid");
         } else {
             eprintln!("[FAIL] Ed25519 signature invalid");
