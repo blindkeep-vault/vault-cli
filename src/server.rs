@@ -102,16 +102,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/me", get(me))
         .route("/items", post(create_item))
         .route("/items", get(list_items))
-        .route("/items/:id", get(get_item))
-        .route("/items/:id", delete(delete_item))
-        .route("/items/:id/blob", get(get_item_blob))
+        .route("/items/{id}", get(get_item))
+        .route("/items/{id}", delete(delete_item))
+        .route("/items/{id}/blob", get(get_item_blob))
         .route("/items/upload-url", post(upload_url))
-        .route("/items/upload/*key", put(upload_blob))
+        .route("/items/upload/{*key}", put(upload_blob))
         .route("/grants", post(create_grant))
         .route("/grants", get(list_grants))
-        .route("/grants/:id", get(get_grant))
-        .route("/grants/:id/access", post(access_grant))
-        .route("/grants/:id", delete(revoke_grant))
+        .route("/grants/{id}", get(get_grant))
+        .route("/grants/{id}/access", post(access_grant))
+        .route("/grants/{id}", delete(revoke_grant))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
