@@ -72,3 +72,72 @@ jobs:
         with:
           generate_release_notes: true
           files: vault-cli-*
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Compute checksums
+        id: shas
+        run: |
+          echo "x86_64_darwin=$(sha256sum vault-cli-x86_64-apple-darwin | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "aarch64_darwin=$(sha256sum vault-cli-aarch64-apple-darwin | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "x86_64_linux=$(sha256sum vault-cli-x86_64-unknown-linux-gnu | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "aarch64_linux=$(sha256sum vault-cli-aarch64-unknown-linux-gnu | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Update formula
+        env:
+          GH_TOKEN: ${{ secrets.VAULT_REPOS_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          FORMULA=$(cat <<RUBY
+          class VaultCli < Formula
+            desc "CLI for BlindKeep — end-to-end encrypted secret management"
+            homepage "https://blindkeep.com"
+            version "${VERSION}"
+            license any_of: ["MIT", "Apache-2.0"]
+
+            on_macos do
+              on_intel do
+                url "https://github.com/blindkeep-vault/vault-cli/releases/download/v#{version}/vault-cli-x86_64-apple-darwin"
+                sha256 "${{ steps.shas.outputs.x86_64_darwin }}"
+              end
+              on_arm do
+                url "https://github.com/blindkeep-vault/vault-cli/releases/download/v#{version}/vault-cli-aarch64-apple-darwin"
+                sha256 "${{ steps.shas.outputs.aarch64_darwin }}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/blindkeep-vault/vault-cli/releases/download/v#{version}/vault-cli-x86_64-unknown-linux-gnu"
+                sha256 "${{ steps.shas.outputs.x86_64_linux }}"
+              end
+              on_arm do
+                url "https://github.com/blindkeep-vault/vault-cli/releases/download/v#{version}/vault-cli-aarch64-unknown-linux-gnu"
+                sha256 "${{ steps.shas.outputs.aarch64_linux }}"
+              end
+            end
+
+            def install
+              binary = Dir["vault-cli-*"].first || "vault-cli"
+              bin.install binary => "vault-cli"
+            end
+
+            test do
+              assert_match "vault-cli", shell_output("#{bin}/vault-cli --help")
+            end
+          end
+          RUBY
+          )
+
+          gh api repos/blindkeep-vault/homebrew-tap/contents/Formula/vault-cli.rb \
+            --method PUT \
+            -f message="Update vault-cli to ${VERSION}" \
+            -f content="$(echo "$FORMULA" | base64 -w0)" \
+            -f sha="$(gh api repos/blindkeep-vault/homebrew-tap/contents/Formula/vault-cli.rb --jq '.sha')"

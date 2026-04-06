@@ -6,11 +6,31 @@ All encryption happens locally. The server never sees your plaintext or keys.
 
 ## Install
 
+### Quick install (macOS and Linux)
+
+```bash
+curl -fsSL https://blindkeep.com/install.sh | sh
+```
+
+Detects your OS and architecture, downloads the latest binary to `~/.local/bin`. Use `--to` to choose a different directory:
+
+```bash
+curl -fsSL https://blindkeep.com/install.sh | sh -s -- --to /usr/local/bin
+```
+
+### Homebrew (macOS and Linux)
+
+```bash
+brew install blindkeep-vault/tap/vault-cli
+```
+
+### Cargo
+
 ```bash
 cargo install --git ssh://git@github.com/blindkeep-vault/vault-cli.git
 ```
 
-Or build from source:
+### Build from source
 
 ```bash
 git clone git@github.com:blindkeep-vault/vault-cli.git
