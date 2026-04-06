@@ -119,6 +119,27 @@ pub fn run_get(
         .find(|(_, blob, _)| blob.display_name() == label);
     match found {
         Some((_, blob, _)) => {
+            if blob.is_file() {
+                eprintln!("'{}' is a file:", label);
+                if let Some(f) = &blob.filename {
+                    eprintln!("  Filename: {}", f);
+                }
+                if let Some(m) = &blob.mime_type {
+                    eprintln!("  Type:     {}", m);
+                }
+                if let Some(s) = blob.file_size {
+                    if s >= 1_048_576 {
+                        eprintln!("  Size:     {:.1} MB", s as f64 / 1_048_576.0);
+                    } else if s >= 1024 {
+                        eprintln!("  Size:     {:.1} KB", s as f64 / 1024.0);
+                    } else {
+                        eprintln!("  Size:     {} bytes", s);
+                    }
+                }
+                eprintln!();
+                eprintln!("To download: vault-cli file get \"{}\"", label);
+                std::process::exit(1);
+            }
             if let Some(path) = output {
                 std::fs::write(&path, blob.secret_value().unwrap_or("")).unwrap_or_else(|e| {
                     eprintln!("error writing {}: {}", path.display(), e);
