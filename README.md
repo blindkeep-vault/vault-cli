@@ -19,7 +19,7 @@ cargo build --release
 # Binary at target/release/vault-cli
 ```
 
-Requires Rust 1.70+.
+Requires Rust 1.80+.
 
 ## Usage
 
@@ -95,10 +95,10 @@ vault-cli notarizations --token $VAULT_TOKEN
 ### Secrets
 
 ```bash
-# Store a secret
+# Store a secret (prefer stdin or @file over CLI args)
 vault-cli put prod/db-password "hunter2"
 
-# Read from stdin
+# Read from stdin (recommended -- not visible in process listings)
 echo -n "hunter2" | vault-cli put prod/db-password
 
 # Read from file
