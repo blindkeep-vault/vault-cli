@@ -23,6 +23,30 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
         crate::GrantAction::Access { id, output } => run_grant_access(client, api_url, &id, output),
         crate::GrantAction::Revoke { id } => run_grant_revoke(client, api_url, &id),
         crate::GrantAction::Resend { id } => run_grant_resend(client, api_url, &id),
+        crate::GrantAction::CreateLink {
+            label,
+            to,
+            max_views,
+            expires,
+            read_only,
+        } => run_grant_create_link(
+            client,
+            api_url,
+            &label,
+            to.as_deref(),
+            max_views,
+            expires.as_deref(),
+            read_only,
+        ),
+        crate::GrantAction::AccessLink { url, key, output } => {
+            run_grant_access_link(client, api_url, &url, key.as_deref(), output)
+        }
+        crate::GrantAction::Reshare {
+            id,
+            to,
+            max_views,
+            expires,
+        } => run_grant_reshare(client, api_url, &id, &to, max_views, expires.as_deref()),
     }
 }
 
@@ -426,6 +450,571 @@ pub fn run_grant_revoke(client: &reqwest::blocking::Client, api_url: &str, grant
     }
 
     eprintln!("Grant {} revoked.", grant_id);
+}
+
+/// Encrypt link_secret with claimKey using AES-256-GCM (compatible with Web UI's SubtleCrypto)
+fn encrypt_claim_secret(claim_key: &[u8; 32], link_secret: &[u8; 32]) -> Vec<u8> {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+    let cipher = Aes256Gcm::new(claim_key.into());
+    let mut iv = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut iv);
+    let nonce = Nonce::from_slice(&iv);
+    let ciphertext = cipher
+        .encrypt(nonce, link_secret.as_ref())
+        .unwrap_or_else(|e| {
+            eprintln!("error encrypting claim secret: {}", e);
+            std::process::exit(1);
+        });
+    let mut result = Vec::with_capacity(12 + ciphertext.len());
+    result.extend_from_slice(&iv);
+    result.extend_from_slice(&ciphertext);
+    result
+}
+
+/// Decrypt link_secret from claim_ciphertext using AES-256-GCM
+fn decrypt_claim_secret(claim_key: &[u8; 32], claim_ciphertext: &[u8]) -> [u8; 32] {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+    if claim_ciphertext.len() < 12 {
+        eprintln!("error: claim_ciphertext too short");
+        std::process::exit(1);
+    }
+    let iv = &claim_ciphertext[..12];
+    let ct = &claim_ciphertext[12..];
+    let cipher = Aes256Gcm::new(claim_key.into());
+    let nonce = Nonce::from_slice(iv);
+    let plaintext = cipher.decrypt(nonce, ct).unwrap_or_else(|e| {
+        eprintln!("error decrypting claim secret: {}", e);
+        std::process::exit(1);
+    });
+    if plaintext.len() != 32 {
+        eprintln!("error: decrypted link_secret has wrong length");
+        std::process::exit(1);
+    }
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&plaintext);
+    result
+}
+
+/// Parse a grant-accept URL: /#/grant-accept/{id}/{secret} or full URL
+fn parse_grant_url(url: &str) -> Option<(String, String)> {
+    // Try: .../grant-accept/{id}/{secret}
+    if let Some(idx) = url.find("/grant-accept/") {
+        let rest = &url[idx + 14..];
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            let secret = parts[1]
+                .split(&['?', '#', '&'][..])
+                .next()
+                .unwrap_or(parts[1]);
+            return Some((parts[0].to_string(), secret.to_string()));
+        }
+    }
+    None
+}
+
+pub fn run_grant_create_link(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    label: &str,
+    to_email: Option<&str>,
+    max_views: Option<u32>,
+    expires: Option<&str>,
+    read_only: bool,
+) {
+    let auth = get_auth(client, api_url);
+    let (jwt, master_key, effective_url) = match &auth {
+        AuthContext::Full {
+            jwt,
+            master_key,
+            api_url,
+        } => (jwt.as_str(), master_key, api_url.as_str()),
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot create grants");
+            std::process::exit(1);
+        }
+    };
+
+    // Find the item by label
+    let secrets = fetch_and_decrypt_secrets(client, &auth);
+    let (item_id, _, _) = secrets
+        .iter()
+        .find(|(_, blob, _)| blob.display_name() == label)
+        .unwrap_or_else(|| {
+            eprintln!("error: secret '{}' not found", label);
+            std::process::exit(1);
+        });
+
+    // Decrypt item key
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+
+    let item_resp = client
+        .get(format!("{}/items/{}", effective_url, item_id))
+        .header("Authorization", format!("Bearer {}", jwt))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+    if !item_resp.status().is_success() {
+        eprintln!("error: failed to fetch item");
+        std::process::exit(1);
+    }
+    let item: serde_json::Value = item_resp.json().expect("invalid JSON");
+    let wrapped_key = json_to_bytes(&item["wrapped_key"]);
+    let nonce = json_to_bytes(&item["nonce"]);
+
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let wrap_aad = if user_id.is_empty() {
+        Vec::new()
+    } else {
+        format!("wrap:{}", user_id).into_bytes()
+    };
+    let item_key_plain =
+        vault_core::crypto::decrypt_item_auto(&enc_key, &wrapped_key, &nonce, &wrap_aad)
+            .unwrap_or_else(|e| {
+                eprintln!("error decrypting item key: {}", e);
+                std::process::exit(1);
+            });
+    let mut item_key = [0u8; 32];
+    item_key.copy_from_slice(&item_key_plain);
+
+    // Generate random link_secret
+    let mut link_secret = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut link_secret);
+
+    // Wrap item_key with link_secret (no AAD initially; AAD added after we know grant_id)
+    let ls_wrapped = vault_core::crypto::encrypt_item_v1(&link_secret, &item_key, b"")
+        .unwrap_or_else(|e| {
+            eprintln!("error wrapping key with link-secret: {}", e);
+            std::process::exit(1);
+        });
+
+    // Generate claim_key and encrypt link_secret
+    let mut claim_key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut claim_key);
+    let claim_ciphertext = encrypt_claim_secret(&claim_key, &link_secret);
+
+    // Hash claim_key for server-side lookup
+    let mut hasher = Sha256::new();
+    hasher.update(claim_key);
+    let claim_token_hash = hex::encode(hasher.finalize());
+
+    // Build policy
+    let allowed_ops = if read_only {
+        serde_json::json!(["view"])
+    } else {
+        serde_json::json!(["view", "download"])
+    };
+    let mut policy = serde_json::json!({
+        "allowed_ops": allowed_ops,
+        "notify_on_access": false,
+    });
+    if let Some(n) = max_views {
+        policy["max_views"] = serde_json::json!(n);
+    }
+    if let Some(exp) = expires {
+        let duration = parse_duration(exp);
+        let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
+        policy["expires_at"] = serde_json::json!(expires_at);
+    }
+
+    let grantee_email = to_email.unwrap_or("link-secret@blindkeep.com");
+
+    // POST /grants with empty ephemeral_pubkey (link-secret mode)
+    let mut grant_body = serde_json::json!({
+        "item_id": item_id,
+        "grantee_email": grantee_email,
+        "wrapped_key": ls_wrapped.ciphertext,
+        "ephemeral_pubkey": [],
+        "policy": policy,
+        "claim_token_hash": claim_token_hash,
+        "claim_ciphertext": claim_ciphertext,
+    });
+
+    // Handle file_wrapped_key if item has one
+    let has_file_blob = item["file_blob_key"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty());
+    if has_file_blob {
+        // Decrypt the file_wrapped_key, then re-wrap with link_secret
+        let file_wk = json_to_bytes(&item["file_wrapped_key"]);
+        let file_nonce = json_to_bytes(&item["file_nonce"]);
+        if !file_wk.is_empty() && !file_nonce.is_empty() {
+            let file_key_plain =
+                vault_core::crypto::decrypt_item_auto(&enc_key, &file_wk, &file_nonce, &wrap_aad)
+                    .unwrap_or_else(|e| {
+                        eprintln!("error decrypting file key: {}", e);
+                        std::process::exit(1);
+                    });
+            // Wrap file key with link_secret: nonce(24) + ciphertext
+            let file_enc = encrypt_item(&link_secret, &file_key_plain).unwrap_or_else(|e| {
+                eprintln!("error wrapping file key: {}", e);
+                std::process::exit(1);
+            });
+            let mut file_wrapped: Vec<u8> = Vec::with_capacity(24 + file_enc.ciphertext.len());
+            file_wrapped.extend_from_slice(&file_enc.nonce);
+            file_wrapped.extend_from_slice(&file_enc.ciphertext);
+            grant_body["file_wrapped_key"] = serde_json::json!(file_wrapped);
+        }
+    }
+
+    let resp = client
+        .post(format!("{}/grants", effective_url))
+        .header("Authorization", format!("Bearer {}", jwt))
+        .json(&grant_body)
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    let body: serde_json::Value = resp.json().unwrap_or_default();
+    let grant_id = body["id"].as_str().unwrap_or("?");
+
+    // Build share URL
+    let claim_key_b64 = URL_SAFE_NO_PAD.encode(claim_key);
+    let base_url = effective_url
+        .replace("/api.", "/app.")
+        .replace("api.blindkeep.com", "app.blindkeep.com");
+    let share_url = format!("{}/#/grant-accept/{}/{}", base_url, grant_id, claim_key_b64);
+
+    // Optionally send the link via email
+    if to_email.is_some() {
+        let _ = client
+            .post(format!("{}/grants/{}/send-link", effective_url, grant_id))
+            .header("Authorization", format!("Bearer {}", jwt))
+            .json(&serde_json::json!({ "share_url": share_url }))
+            .send();
+    }
+
+    eprintln!("Link-secret grant created.");
+    eprintln!("Grant ID: {}", grant_id);
+    eprintln!();
+    eprintln!("Share URL:");
+    println!("{}", share_url);
+}
+
+pub fn run_grant_access_link(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    url: &str,
+    key_arg: Option<&str>,
+    output: Option<PathBuf>,
+) {
+    // Parse grant_id and claim_key from URL or args
+    let (grant_id, claim_key_b64) = if let Some((id, secret)) = parse_grant_url(url) {
+        (id, secret)
+    } else if uuid::Uuid::parse_str(url).is_ok() {
+        let k = key_arg.unwrap_or_else(|| {
+            eprintln!("error: provide a grant URL or grant ID with --key");
+            std::process::exit(1);
+        });
+        (url.to_string(), k.to_string())
+    } else {
+        eprintln!("error: could not parse grant URL");
+        std::process::exit(1);
+    };
+
+    let claim_key_bytes = URL_SAFE_NO_PAD.decode(&claim_key_b64).unwrap_or_else(|e| {
+        eprintln!("error decoding claim key: {}", e);
+        std::process::exit(1);
+    });
+    if claim_key_bytes.len() != 32 {
+        eprintln!("error: claim key has wrong length (expected 32 bytes)");
+        std::process::exit(1);
+    }
+    let mut claim_key = [0u8; 32];
+    claim_key.copy_from_slice(&claim_key_bytes);
+
+    // Hash claim_key for server lookup
+    let mut hasher = Sha256::new();
+    hasher.update(claim_key);
+    let token_hash = hex::encode(hasher.finalize());
+
+    // Try claim-token endpoint (works unauthenticated or authenticated)
+    // First try public preview
+    let preview_resp = client
+        .post(format!("{}/grants/{}/preview", api_url, grant_id))
+        .json(&serde_json::json!({ "token_hash": token_hash }))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !preview_resp.status().is_success() {
+        let text = preview_resp.text().unwrap_or_default();
+        eprintln!("error: failed to access grant: {}", text);
+        std::process::exit(1);
+    }
+
+    let grant: serde_json::Value = preview_resp.json().expect("invalid JSON");
+
+    // Decrypt claim_ciphertext to get link_secret
+    let claim_ct = json_to_bytes(&grant["claim_ciphertext"]);
+    let link_secret = decrypt_claim_secret(&claim_key, &claim_ct);
+
+    // Decrypt item key using link_secret
+    let grant_wrapped_key = json_to_bytes(&grant["wrapped_key"]);
+    if grant_wrapped_key.len() < 25 {
+        eprintln!("error: grant wrapped_key too short");
+        std::process::exit(1);
+    }
+
+    // wrapped_key format: the server stores it as ciphertext only; nonce is separate
+    // But for link-secret grants from the web UI, wrapped_key is just the ciphertext
+    // and nonce is stored separately
+    let grant_nonce = json_to_bytes(&grant["nonce"]);
+    let item_key_plain =
+        vault_core::crypto::decrypt_item_auto(&link_secret, &grant_wrapped_key, &grant_nonce, b"")
+            .unwrap_or_else(|e| {
+                eprintln!("error decrypting item key: {}", e);
+                std::process::exit(1);
+            });
+    let mut item_key = [0u8; 32];
+    item_key.copy_from_slice(&item_key_plain);
+
+    // Decrypt the blob
+    let encrypted_blob_b64 = grant["encrypted_blob"].as_str().unwrap_or("");
+    let blob_data = STANDARD.decode(encrypted_blob_b64).unwrap_or_else(|e| {
+        eprintln!("error decoding blob: {}", e);
+        std::process::exit(1);
+    });
+    if blob_data.len() < 25 {
+        eprintln!("error: encrypted blob too short");
+        std::process::exit(1);
+    }
+
+    let grantor_id = grant["grantor_id"].as_str().unwrap_or("");
+    let blob_aad = if grantor_id.is_empty() {
+        Vec::new()
+    } else {
+        format!("item:{}", grantor_id).into_bytes()
+    };
+
+    let plaintext = if blob_data[0] == 0x01 && blob_data.len() > 25 {
+        let nonce = &blob_data[1..25];
+        let ciphertext = &blob_data[25..];
+        vault_core::crypto::decrypt_item_auto(&item_key, ciphertext, nonce, &blob_aad)
+            .or_else(|_| decrypt_item(&item_key, &blob_data[24..], &blob_data[..24]))
+    } else {
+        decrypt_item(&item_key, &blob_data[24..], &blob_data[..24])
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("error decrypting grant content: {}", e);
+        std::process::exit(1);
+    });
+
+    // Output
+    if let Ok(blob) = serde_json::from_slice::<SecretBlob>(&plaintext) {
+        if let Some(path) = output {
+            std::fs::write(&path, blob.secret_value().unwrap_or("")).unwrap_or_else(|e| {
+                eprintln!("error writing {}: {}", path.display(), e);
+                std::process::exit(1);
+            });
+            eprintln!("Written to {}", path.display());
+        } else {
+            print!("{}", blob.secret_value().unwrap_or(""));
+        }
+    } else if let Ok(text) = std::str::from_utf8(&plaintext) {
+        if let Some(path) = output {
+            std::fs::write(&path, text).unwrap_or_else(|e| {
+                eprintln!("error writing {}: {}", path.display(), e);
+                std::process::exit(1);
+            });
+            eprintln!("Written to {}", path.display());
+        } else {
+            print!("{}", text);
+        }
+    } else if let Some(path) = output {
+        std::fs::write(&path, &*plaintext).unwrap_or_else(|e| {
+            eprintln!("error writing {}: {}", path.display(), e);
+            std::process::exit(1);
+        });
+        eprintln!("Written to {}", path.display());
+    } else {
+        eprintln!("error: grant content is binary (use -o to save to file)");
+        std::process::exit(1);
+    }
+}
+
+pub fn run_grant_reshare(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    grant_id: &str,
+    to_email: &str,
+    max_views: Option<u32>,
+    expires: Option<&str>,
+) {
+    let auth = get_auth(client, api_url);
+    let (jwt, master_key, effective_url) = match &auth {
+        AuthContext::Full {
+            jwt,
+            master_key,
+            api_url,
+        } => (jwt.as_str(), master_key, api_url.as_str()),
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot reshare grants");
+            std::process::exit(1);
+        }
+    };
+
+    // Access the grant to get the item key
+    let resp = client
+        .post(format!("{}/grants/{}/access", effective_url, grant_id))
+        .header("Authorization", format!("Bearer {}", jwt))
+        .json(&serde_json::json!({"operation": "view"}))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error accessing grant: {}", text);
+        std::process::exit(1);
+    }
+
+    let body: serde_json::Value = resp.json().expect("invalid JSON");
+
+    // Decrypt item key from grant
+    let grant_wrapped_key = json_to_bytes(&body["wrapped_key"]);
+    let ephemeral_pubkey = json_to_bytes(&body["ephemeral_pubkey"]);
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+
+    let me_resp = client
+        .get(format!("{}/auth/me", effective_url))
+        .header("Authorization", format!("Bearer {}", jwt))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+    if !me_resp.status().is_success() {
+        eprintln!("error: failed to fetch profile");
+        std::process::exit(1);
+    }
+    let me: serde_json::Value = me_resp.json().expect("invalid JSON");
+    let encrypted_privkey = json_to_bytes(&me["encrypted_private_key"]);
+    let my_pubkey_bytes = json_to_bytes(&me["public_key"]);
+
+    let private_key = decrypt_private_key(&enc_key, &encrypted_privkey).unwrap_or_else(|e| {
+        eprintln!("error decrypting private key: {}", e);
+        std::process::exit(1);
+    });
+
+    if my_pubkey_bytes.len() != 32 || ephemeral_pubkey.len() != 32 {
+        eprintln!("error: invalid key data on grant");
+        std::process::exit(1);
+    }
+    let mut eph_pub = [0u8; 32];
+    eph_pub.copy_from_slice(&ephemeral_pubkey);
+    let mut my_pubkey = [0u8; 32];
+    my_pubkey.copy_from_slice(&my_pubkey_bytes);
+
+    let item_key = unwrap_grant_key(&private_key, &eph_pub, &grant_wrapped_key, &my_pubkey)
+        .unwrap_or_else(|e| {
+            eprintln!("error unwrapping grant key: {}", e);
+            std::process::exit(1);
+        });
+
+    // Fetch recipient's public key
+    let pk_resp = client
+        .get(format!("{}/users/public-key", effective_url))
+        .query(&[("email", to_email)])
+        .header("Authorization", format!("Bearer {}", jwt))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+    if !pk_resp.status().is_success() {
+        if pk_resp.status().as_u16() == 404 {
+            eprintln!(
+                "error: user '{}' not found (must be a verified BlindKeep user)",
+                to_email
+            );
+        } else {
+            eprintln!("error: failed to fetch public key for '{}'", to_email);
+        }
+        std::process::exit(1);
+    }
+    let pk_body: serde_json::Value = pk_resp.json().expect("invalid JSON");
+    let recipient_pubkey_bytes = json_to_bytes(&pk_body["public_key"]);
+    if recipient_pubkey_bytes.len() != 32 {
+        eprintln!("error: recipient has invalid public key");
+        std::process::exit(1);
+    }
+    let mut recipient_pubkey = [0u8; 32];
+    recipient_pubkey.copy_from_slice(&recipient_pubkey_bytes);
+
+    // Wrap item key for new recipient
+    let (new_wrapped_key, new_eph_pubkey) = wrap_key_for_grant(&item_key, &recipient_pubkey)
+        .unwrap_or_else(|e| {
+            eprintln!("error wrapping key: {}", e);
+            std::process::exit(1);
+        });
+
+    // Build policy
+    let mut policy = serde_json::json!({
+        "allowed_ops": ["view", "download"],
+        "notify_on_access": false,
+    });
+    if let Some(n) = max_views {
+        policy["max_views"] = serde_json::json!(n);
+    }
+    if let Some(exp) = expires {
+        let duration = parse_duration(exp);
+        let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
+        policy["expires_at"] = serde_json::json!(expires_at);
+    }
+
+    // Get item_id from the original grant
+    let item_id = body["item_id"].as_str().unwrap_or("");
+
+    // Create new grant for recipient
+    let resp = client
+        .post(format!("{}/grants", effective_url))
+        .header("Authorization", format!("Bearer {}", jwt))
+        .json(&serde_json::json!({
+            "item_id": item_id,
+            "grantee_email": to_email,
+            "wrapped_key": new_wrapped_key,
+            "ephemeral_pubkey": new_eph_pubkey.to_vec(),
+            "policy": policy,
+        }))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    let result: serde_json::Value = resp.json().unwrap_or_default();
+    let new_grant_id = result["id"].as_str().unwrap_or("?");
+    eprintln!(
+        "Grant reshared: {} -> {} (new grant ID: {})",
+        grant_id, to_email, new_grant_id
+    );
 }
 
 pub fn run_grant_resend(client: &reqwest::blocking::Client, api_url: &str, grant_id: &str) {

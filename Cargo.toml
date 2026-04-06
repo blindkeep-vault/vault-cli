@@ -20,6 +20,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 chrono = "0.4"
 bip39 = "2"
 rand = "0.8"
+aes-gcm = "0.10"
 mime_guess = "2"
 rpassword = "7"
 dirs = "6"

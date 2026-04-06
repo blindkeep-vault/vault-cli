@@ -41,6 +41,12 @@ pub(crate) enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Claim an anonymous drop into your vault
+    Claim {
+        /// Drop mnemonic (12 words), pickup URL, or drop ID + key
+        key: String,
+        key2: Option<String>,
+    },
     /// Encrypt and upload a file as an anonymous drop
     Drop {
         /// File to encrypt and upload
@@ -77,6 +83,8 @@ pub(crate) enum Command {
     Register,
     /// Log in with email and password
     Login,
+    /// Change account password
+    ChangePassword,
     /// Clear stored session
     Logout,
     /// Manage API keys
@@ -133,6 +141,43 @@ pub(crate) enum Command {
     },
     /// Lock the running agent (zeroize cached key)
     Lock,
+    /// View audit log
+    Audit {
+        /// Filter by resource type (e.g., "item", "grant", "group")
+        #[arg(long, alias = "type")]
+        resource_type: Option<String>,
+        /// Maximum number of entries
+        #[arg(long, default_value = "50")]
+        limit: i64,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Billing information
+    Billing {
+        #[command(subcommand)]
+        action: BillingAction,
+    },
+    /// Deadman switch management
+    Deadman {
+        #[command(subcommand)]
+        action: DeadmanAction,
+    },
+    /// Organize items into groups
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+    /// Dead drop inbox management
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
+    /// Digital will / legacy access management
+    Will {
+        #[command(subcommand)]
+        action: WillAction,
+    },
     /// Start a self-hosted BlindKeep-compatible API server
     Serve {
         /// Port to listen on
@@ -297,6 +342,48 @@ pub(crate) enum GrantAction {
         /// Grant ID (UUID)
         id: String,
     },
+    /// Share a secret via link (no recipient account needed)
+    CreateLink {
+        /// Secret label to share
+        label: String,
+        /// Recipient's email (for notification, optional)
+        #[arg(long)]
+        to: Option<String>,
+        /// Maximum number of views allowed
+        #[arg(long)]
+        max_views: Option<u32>,
+        /// Expiry duration (e.g., "24h", "7d", "30d", "1y")
+        #[arg(long)]
+        expires: Option<String>,
+        /// Grant read-only access (view only, no download)
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Access a grant via link URL containing a link-secret
+    AccessLink {
+        /// Grant URL with embedded link-secret, or grant ID
+        url: String,
+        /// Link-secret (base64url, if not embedded in URL)
+        #[arg(long)]
+        key: Option<String>,
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Re-share a received grant to another user
+    Reshare {
+        /// Grant ID to re-share
+        id: String,
+        /// Recipient's email address
+        #[arg(long)]
+        to: String,
+        /// Maximum number of views allowed
+        #[arg(long)]
+        max_views: Option<u32>,
+        /// Expiry duration (e.g., "24h", "7d", "30d", "1y")
+        #[arg(long)]
+        expires: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -318,6 +405,156 @@ pub(crate) enum FileAction {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum BillingAction {
+    /// Show current storage balance and burn rate
+    Balance {
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show billing/topup history
+    History {
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DeadmanAction {
+    /// Enable deadman switch with check-in interval
+    Enable {
+        /// Check-in interval in days (7-365)
+        #[arg(long)]
+        interval: u32,
+    },
+    /// Show deadman switch status
+    Status,
+    /// Record a check-in (reset the timer)
+    Checkin,
+    /// Disable deadman switch
+    Disable,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum GroupAction {
+    /// Create a new group
+    Create {
+        /// Group name
+        name: String,
+    },
+    /// List all groups
+    List {
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show items in a group
+    Show {
+        /// Group name or ID
+        group: String,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a group
+    Rename {
+        /// Group name or ID
+        group: String,
+        /// New name
+        new_name: String,
+    },
+    /// Delete a group
+    Delete {
+        /// Group name or ID
+        group: String,
+    },
+    /// Add an item to a group
+    Add {
+        /// Group name or ID
+        group: String,
+        /// Item label
+        label: String,
+    },
+    /// Remove an item from a group
+    Remove {
+        /// Group name or ID
+        group: String,
+        /// Item label
+        label: String,
+    },
+    /// List items in a group
+    Items {
+        /// Group name or ID
+        group: String,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum InboxAction {
+    /// Create a new dead drop inbox
+    Create {
+        /// Custom URL slug (3-63 chars, lowercase alphanumeric + hyphens)
+        #[arg(long)]
+        slug: Option<String>,
+        /// Display label for senders
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List your inboxes
+    List {
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete an inbox
+    Delete {
+        /// Inbox ID
+        id: String,
+    },
+    /// Get public info for an inbox (no auth required)
+    Info {
+        /// Inbox ID or slug
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WillAction {
+    /// Create a digital will
+    Create {
+        /// Heir's email address
+        #[arg(long)]
+        heir: String,
+        /// Grace period in days before heir can access (1-365, default: 30)
+        #[arg(long, default_value = "30")]
+        grace_days: u32,
+        /// Comma-separated list of item labels to include (default: all)
+        #[arg(long)]
+        items: Option<String>,
+    },
+    /// Show current will configuration
+    Show,
+    /// Update an existing will
+    Update {
+        /// New heir email (optional, keeps current if omitted)
+        #[arg(long)]
+        heir: Option<String>,
+        /// New grace period in days
+        #[arg(long)]
+        grace_days: Option<u32>,
+        /// Comma-separated list of item labels (replaces existing)
+        #[arg(long)]
+        items: Option<String>,
+    },
+    /// Delete the will
+    Delete,
+}
+
 pub(crate) enum ParsedInput {
     Direct {
         drop_id: String,
@@ -336,6 +573,9 @@ fn main() {
     match cli.command {
         Some(Command::Download { key, key2, output }) => {
             cmd::drops::run_drop_download(&client, &cli.api_url, &key, key2.as_deref(), output);
+        }
+        Some(Command::Claim { key, key2 }) => {
+            cmd::drops::run_claim(&client, &cli.api_url, &key, key2.as_deref());
         }
         Some(Command::Drop { file }) => {
             cmd::drops::run_drop_upload(&client, &cli.api_url, &file);
@@ -369,6 +609,9 @@ fn main() {
         }
         Some(Command::Login) => {
             cmd::auth::run_login(&client, &cli.api_url);
+        }
+        Some(Command::ChangePassword) => {
+            cmd::auth::run_change_password(&client, &cli.api_url);
         }
         Some(Command::Logout) => {
             cmd::auth::run_logout();
@@ -428,6 +671,39 @@ fn main() {
             AgentAction::Status => agent::run_status(),
         },
         Some(Command::Lock) => agent::run_lock(),
+        Some(Command::Audit {
+            resource_type,
+            limit,
+            json,
+        }) => {
+            cmd::audit::run_audit(
+                &client,
+                &cli.api_url,
+                resource_type.as_deref(),
+                Some(limit),
+                json,
+            );
+        }
+        Some(Command::Billing { action }) => match action {
+            BillingAction::Balance { json } => {
+                cmd::billing::run_billing_balance(&client, &cli.api_url, json);
+            }
+            BillingAction::History { json } => {
+                cmd::billing::run_billing_history(&client, &cli.api_url, json);
+            }
+        },
+        Some(Command::Deadman { action }) => {
+            cmd::deadman::run_deadman(&client, &cli.api_url, action);
+        }
+        Some(Command::Group { action }) => {
+            cmd::groups::run_group(&client, &cli.api_url, action);
+        }
+        Some(Command::Inbox { action }) => {
+            cmd::inbox::run_inbox(&client, &cli.api_url, action);
+        }
+        Some(Command::Will { action }) => {
+            cmd::will::run_will(&client, &cli.api_url, action);
+        }
         Some(Command::Serve {
             port,
             host,

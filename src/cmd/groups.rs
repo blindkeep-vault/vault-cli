@@ -1,0 +1,615 @@
+use super::*;
+
+pub fn run_group(client: &reqwest::blocking::Client, api_url: &str, action: crate::GroupAction) {
+    match action {
+        crate::GroupAction::Create { name } => run_create(client, api_url, &name),
+        crate::GroupAction::List { json } => run_list(client, api_url, json),
+        crate::GroupAction::Show { group, json } => run_show(client, api_url, &group, json),
+        crate::GroupAction::Rename { group, new_name } => {
+            run_rename(client, api_url, &group, &new_name)
+        }
+        crate::GroupAction::Delete { group } => run_delete(client, api_url, &group),
+        crate::GroupAction::Add { group, label } => run_add(client, api_url, &group, &label),
+        crate::GroupAction::Remove { group, label } => run_remove(client, api_url, &group, &label),
+        crate::GroupAction::Items { group, json } => run_items(client, api_url, &group, json),
+    }
+}
+
+fn encrypt_group_blob(name: &str, enc_key: &[u8; 32], user_id: &str) -> (String, Vec<u8>, Vec<u8>) {
+    let blob_json = serde_json::json!({ "name": name }).to_string();
+
+    // Generate random group key
+    let mut group_key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut group_key);
+
+    // Encrypt blob with group key
+    let blob_aad = format!("group:{}", user_id);
+    let enc_blob =
+        vault_core::crypto::encrypt_item_v1(&group_key, blob_json.as_bytes(), blob_aad.as_bytes())
+            .unwrap_or_else(|e| {
+                eprintln!("error encrypting group: {}", e);
+                std::process::exit(1);
+            });
+
+    let mut blob_data = Vec::with_capacity(1 + 24 + enc_blob.ciphertext.len());
+    blob_data.push(0x01);
+    blob_data.extend_from_slice(&enc_blob.nonce);
+    blob_data.extend_from_slice(&enc_blob.ciphertext);
+    let blob_b64 = STANDARD.encode(&blob_data);
+
+    // Wrap group key with enc_key
+    let wrap_aad = format!("wrap:{}", user_id);
+    let wrapped = vault_core::crypto::encrypt_item_v1(enc_key, &group_key, wrap_aad.as_bytes())
+        .unwrap_or_else(|e| {
+            eprintln!("error wrapping group key: {}", e);
+            std::process::exit(1);
+        });
+
+    (
+        blob_b64,
+        wrapped.ciphertext.to_vec(),
+        wrapped.nonce.to_vec(),
+    )
+}
+
+fn decrypt_group_name(
+    group: &serde_json::Value,
+    enc_key: &[u8; 32],
+    user_id: &str,
+) -> Option<String> {
+    let wrapped_key = json_to_bytes(&group["wrapped_key"]);
+    let nonce = json_to_bytes(&group["nonce"]);
+    if wrapped_key.is_empty() || nonce.is_empty() {
+        return None;
+    }
+
+    let wrap_aad = format!("wrap:{}", user_id);
+    let group_key_plain =
+        vault_core::crypto::decrypt_item_auto(enc_key, &wrapped_key, &nonce, wrap_aad.as_bytes())
+            .ok()?;
+    if group_key_plain.len() != 32 {
+        return None;
+    }
+    let mut group_key = [0u8; 32];
+    group_key.copy_from_slice(&group_key_plain);
+
+    let blob_b64 = group["encrypted_blob"].as_str()?;
+    let blob_data = STANDARD.decode(blob_b64).ok()?;
+    if blob_data.is_empty() {
+        return None;
+    }
+
+    let blob_aad = format!("group:{}", user_id);
+    let plaintext = if blob_data[0] == 0x01 && blob_data.len() > 25 {
+        let nonce = &blob_data[1..25];
+        let ciphertext = &blob_data[25..];
+        vault_core::crypto::decrypt_item_auto(&group_key, ciphertext, nonce, blob_aad.as_bytes())
+            .ok()?
+    } else if blob_data.len() > 24 {
+        decrypt_item(&group_key, &blob_data[24..], &blob_data[..24]).ok()?
+    } else {
+        return None;
+    };
+
+    let parsed: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
+    parsed["name"].as_str().map(|s| s.to_string())
+}
+
+fn fetch_groups_decrypted(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    jwt: &str,
+    enc_key: &[u8; 32],
+    user_id: &str,
+) -> Vec<(String, String, serde_json::Value)> {
+    let resp = client
+        .get(format!("{}/groups", api_url))
+        .header("Authorization", format!("Bearer {}", jwt))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    let groups: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let mut result = Vec::new();
+    for group in groups {
+        let id = group["id"].as_str().unwrap_or("").to_string();
+        if let Some(name) = decrypt_group_name(&group, enc_key, user_id) {
+            result.push((id, name, group));
+        }
+    }
+    result
+}
+
+fn resolve_group_id(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    jwt: &str,
+    enc_key: &[u8; 32],
+    user_id: &str,
+    name_or_id: &str,
+) -> String {
+    // Try as UUID first
+    if uuid::Uuid::parse_str(name_or_id).is_ok() {
+        return name_or_id.to_string();
+    }
+
+    let groups = fetch_groups_decrypted(client, api_url, jwt, enc_key, user_id);
+    groups
+        .iter()
+        .find(|(_, name, _)| name == name_or_id)
+        .map(|(id, _, _)| id.clone())
+        .unwrap_or_else(|| {
+            eprintln!("error: group '{}' not found", name_or_id);
+            std::process::exit(1);
+        })
+}
+
+fn run_create(client: &reqwest::blocking::Client, api_url: &str, name: &str) {
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot create groups");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+
+    let (blob_b64, wrapped_key, nonce) = encrypt_group_blob(name, &enc_key, &user_id);
+
+    let resp = client
+        .post(format!("{}/groups", auth.api_url()))
+        .header("Authorization", format!("Bearer {}", auth.jwt()))
+        .json(&serde_json::json!({
+            "encrypted_blob": blob_b64,
+            "wrapped_key": wrapped_key,
+            "nonce": nonce,
+        }))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    let body: serde_json::Value = resp.json().unwrap_or_default();
+    let id = body["id"].as_str().unwrap_or("?");
+    eprintln!("Group '{}' created (ID: {}).", name, id);
+}
+
+fn run_list(client: &reqwest::blocking::Client, api_url: &str, json: bool) {
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot list groups");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+
+    let groups = fetch_groups_decrypted(client, auth.api_url(), auth.jwt(), &enc_key, &user_id);
+
+    if json {
+        let out: Vec<_> = groups
+            .iter()
+            .map(|(id, name, _)| serde_json::json!({"id": id, "name": name}))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out).expect("serialize"));
+        return;
+    }
+
+    if groups.is_empty() {
+        eprintln!("No groups found.");
+        return;
+    }
+
+    println!("{:<38} NAME", "ID");
+    println!("{}", "-".repeat(60));
+    for (id, name, _) in &groups {
+        println!("{:<38} {}", id, name);
+    }
+}
+
+fn run_show(client: &reqwest::blocking::Client, api_url: &str, group: &str, json: bool) {
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot view groups");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let group_id = resolve_group_id(
+        client,
+        auth.api_url(),
+        auth.jwt(),
+        &enc_key,
+        &user_id,
+        group,
+    );
+
+    // Fetch items in this group
+    run_items_by_id(
+        client,
+        auth.api_url(),
+        auth.jwt(),
+        master_key,
+        &user_id,
+        &group_id,
+        json,
+    );
+}
+
+fn run_rename(client: &reqwest::blocking::Client, api_url: &str, group: &str, new_name: &str) {
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot update groups");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let group_id = resolve_group_id(
+        client,
+        auth.api_url(),
+        auth.jwt(),
+        &enc_key,
+        &user_id,
+        group,
+    );
+
+    let (blob_b64, wrapped_key, nonce) = encrypt_group_blob(new_name, &enc_key, &user_id);
+
+    let resp = client
+        .put(format!("{}/groups/{}", auth.api_url(), group_id))
+        .header("Authorization", format!("Bearer {}", auth.jwt()))
+        .json(&serde_json::json!({
+            "encrypted_blob": blob_b64,
+            "wrapped_key": wrapped_key,
+            "nonce": nonce,
+        }))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    eprintln!("Group renamed to '{}'.", new_name);
+}
+
+fn run_delete(client: &reqwest::blocking::Client, api_url: &str, group: &str) {
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot delete groups");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let group_id = resolve_group_id(
+        client,
+        auth.api_url(),
+        auth.jwt(),
+        &enc_key,
+        &user_id,
+        group,
+    );
+
+    let resp = client
+        .delete(format!("{}/groups/{}", auth.api_url(), group_id))
+        .header("Authorization", format!("Bearer {}", auth.jwt()))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    eprintln!("Group deleted.");
+}
+
+fn run_add(client: &reqwest::blocking::Client, api_url: &str, group: &str, label: &str) {
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot modify groups");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let group_id = resolve_group_id(
+        client,
+        auth.api_url(),
+        auth.jwt(),
+        &enc_key,
+        &user_id,
+        group,
+    );
+
+    // Resolve item by label
+    let secrets = fetch_and_decrypt_secrets(client, &auth);
+    let (item_id, _, _) = secrets
+        .iter()
+        .find(|(_, blob, _)| blob.display_name() == label)
+        .unwrap_or_else(|| {
+            eprintln!("error: item '{}' not found", label);
+            std::process::exit(1);
+        });
+
+    let resp = client
+        .post(format!("{}/groups/{}/items", auth.api_url(), group_id))
+        .header("Authorization", format!("Bearer {}", auth.jwt()))
+        .json(&serde_json::json!({ "item_id": item_id }))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    eprintln!("Item '{}' added to group.", label);
+}
+
+fn run_remove(client: &reqwest::blocking::Client, api_url: &str, group: &str, label: &str) {
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot modify groups");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let group_id = resolve_group_id(
+        client,
+        auth.api_url(),
+        auth.jwt(),
+        &enc_key,
+        &user_id,
+        group,
+    );
+
+    // Resolve item by label
+    let secrets = fetch_and_decrypt_secrets(client, &auth);
+    let (item_id, _, _) = secrets
+        .iter()
+        .find(|(_, blob, _)| blob.display_name() == label)
+        .unwrap_or_else(|| {
+            eprintln!("error: item '{}' not found", label);
+            std::process::exit(1);
+        });
+
+    let resp = client
+        .delete(format!(
+            "{}/groups/{}/items/{}",
+            auth.api_url(),
+            group_id,
+            item_id
+        ))
+        .header("Authorization", format!("Bearer {}", auth.jwt()))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    eprintln!("Item '{}' removed from group.", label);
+}
+
+fn run_items(client: &reqwest::blocking::Client, api_url: &str, group: &str, json: bool) {
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot view groups");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let group_id = resolve_group_id(
+        client,
+        auth.api_url(),
+        auth.jwt(),
+        &enc_key,
+        &user_id,
+        group,
+    );
+
+    run_items_by_id(
+        client,
+        auth.api_url(),
+        auth.jwt(),
+        master_key,
+        &user_id,
+        &group_id,
+        json,
+    );
+}
+
+fn run_items_by_id(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    jwt: &str,
+    master_key: &MasterKey,
+    user_id: &str,
+    group_id: &str,
+    json: bool,
+) {
+    let resp = client
+        .get(format!("{}/groups/{}/items", api_url, group_id))
+        .header("Authorization", format!("Bearer {}", jwt))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    let items: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+
+    let wrap_aad = if user_id.is_empty() {
+        Vec::new()
+    } else {
+        format!("wrap:{}", user_id).into_bytes()
+    };
+
+    let mut decrypted_items = Vec::new();
+    for item in &items {
+        let item_id = item["id"].as_str().unwrap_or("").to_string();
+        let wrapped_key = json_to_bytes(&item["wrapped_key"]);
+        let nonce = json_to_bytes(&item["nonce"]);
+        if wrapped_key.is_empty() || nonce.is_empty() {
+            continue;
+        }
+
+        let item_key_plain = match vault_core::crypto::decrypt_item_auto(
+            &enc_key,
+            &wrapped_key,
+            &nonce,
+            &wrap_aad,
+        ) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        if item_key_plain.len() != 32 {
+            continue;
+        }
+        let mut item_key = [0u8; 32];
+        item_key.copy_from_slice(&item_key_plain);
+
+        let has_file_blob = item["file_blob_key"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty());
+        let blob_opt = if has_file_blob {
+            decrypt_inline_envelope(
+                item["encrypted_blob"].as_str().unwrap_or(""),
+                &item_key,
+                user_id,
+            )
+        } else {
+            decrypt_item_blob(client, api_url, jwt, &item_id, &item_key, user_id)
+        };
+
+        if let Some(blob) = blob_opt {
+            decrypted_items.push((item_id, blob));
+        }
+    }
+
+    if json {
+        let out: Vec<_> = decrypted_items
+            .iter()
+            .map(|(id, blob)| {
+                serde_json::json!({
+                    "id": id,
+                    "name": blob.display_name(),
+                    "type": if blob.is_file() { "file" } else { "secret" },
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out).expect("serialize"));
+        return;
+    }
+
+    if decrypted_items.is_empty() {
+        eprintln!("No items in group.");
+        return;
+    }
+
+    for (_, blob) in &decrypted_items {
+        if blob.is_file() {
+            println!("[file] {}", blob.display_name());
+        } else {
+            println!("{}", blob.display_name());
+        }
+    }
+}

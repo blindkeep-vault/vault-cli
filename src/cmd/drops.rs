@@ -258,6 +258,116 @@ pub fn download_drop(
     eprintln!("Saved to {}", out_path.display());
 }
 
+pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, key2: Option<&str>) {
+    let parsed = parse_input(key, key2);
+
+    // Resolve the drop key (32 bytes) and drop ID
+    let (drop_id, drop_key) = match parsed {
+        crate::ParsedInput::Direct { drop_id, key } => (drop_id, key),
+        crate::ParsedInput::Mnemonic { mnemonic, drop_id } => {
+            let resolved_id = match drop_id {
+                Some(id) => id,
+                None => {
+                    eprintln!("Looking up drop by mnemonic...");
+                    let lookup_key = derive_drop_lookup_key(&mnemonic);
+                    let url = format!("{}/drops/by-words/{}", api_url, lookup_key);
+                    let resp = client.get(&url).send().expect("request failed");
+                    if !resp.status().is_success() {
+                        eprintln!("error: drop not found (expired or wrong words)");
+                        std::process::exit(1);
+                    }
+                    let drop: serde_json::Value = resp.json().expect("invalid JSON");
+                    if drop["claimed"].as_bool() == Some(true) {
+                        eprintln!("error: drop already claimed");
+                        std::process::exit(1);
+                    }
+                    drop["id"].as_str().expect("missing drop id").to_string()
+                }
+            };
+
+            let url = format!("{}/drops/{}", api_url, resolved_id);
+            let resp = client.get(&url).send().expect("request failed");
+            if !resp.status().is_success() {
+                eprintln!("error: drop not found");
+                std::process::exit(1);
+            }
+            let drop_meta: serde_json::Value = resp.json().expect("invalid JSON");
+            if drop_meta["claimed"].as_bool() == Some(true) {
+                eprintln!("error: drop already claimed");
+                std::process::exit(1);
+            }
+
+            let wrapped = drop_meta["wrapped_drop_key"]
+                .as_array()
+                .expect("drop has no wrapped_drop_key (not a mnemonic drop)");
+            let wrapped_bytes: Vec<u8> = wrapped
+                .iter()
+                .map(|v: &serde_json::Value| v.as_u64().unwrap() as u8)
+                .collect();
+
+            let version = drop_meta["drop_key_version"].as_i64().unwrap_or(1) as i32;
+            eprintln!("Deriving wrapping key (v{})...", version);
+            let wrapping_key = derive_drop_wrapping_key(&mnemonic, version);
+            let dk = unwrap_drop_key(&wrapping_key, &wrapped_bytes).unwrap_or_else(|e| {
+                eprintln!("error: failed to unwrap drop key (wrong mnemonic?): {}", e);
+                std::process::exit(1);
+            });
+
+            let mut dk_arr = [0u8; 32];
+            dk_arr.copy_from_slice(dk.as_ref());
+            (resolved_id, dk_arr)
+        }
+    };
+
+    // Authenticate to wrap the key for our vault
+    let auth = get_auth(client, api_url);
+    let master_key = match &auth {
+        AuthContext::Full { master_key, .. } => master_key,
+        AuthContext::Scoped { .. } => {
+            eprintln!("error: scoped API keys cannot claim drops");
+            std::process::exit(1);
+        }
+    };
+
+    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+
+    // Wrap the drop key under our enc_key (V1 with AAD)
+    let wrap_aad = format!("wrap:{}", user_id);
+    let wrapped = vault_core::crypto::encrypt_item_v1(&enc_key, &drop_key, wrap_aad.as_bytes())
+        .unwrap_or_else(|e| {
+            eprintln!("error wrapping key: {}", e);
+            std::process::exit(1);
+        });
+
+    // POST /drops/:id/claim
+    let resp = client
+        .post(format!("{}/drops/{}/claim", auth.api_url(), drop_id))
+        .header("Authorization", format!("Bearer {}", auth.jwt()))
+        .json(&serde_json::json!({
+            "wrapped_key": wrapped.ciphertext,
+            "nonce": wrapped.nonce.to_vec(),
+        }))
+        .send()
+        .unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+
+    if !resp.status().is_success() {
+        let text = resp.text().unwrap_or_default();
+        eprintln!("error: {}", text);
+        std::process::exit(1);
+    }
+
+    let body: serde_json::Value = resp.json().unwrap_or_default();
+    let item_id = body["id"].as_str().unwrap_or("?");
+    eprintln!("Drop claimed! New item ID: {}", item_id);
+}
+
 pub fn run_drop_upload(
     client: &reqwest::blocking::Client,
     api_url: &str,

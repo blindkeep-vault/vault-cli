@@ -1,12 +1,18 @@
 pub mod apikey;
+pub mod audit;
 pub mod auth;
+pub mod billing;
 pub mod common;
+pub mod deadman;
 pub mod drops;
 pub mod env;
 pub mod files;
 pub mod grants;
+pub mod groups;
+pub mod inbox;
 pub mod notarize;
 pub mod secrets;
+pub mod will;
 
 // Re-export shared imports + helpers for sub-modules via `use super::*;`
 pub use base64::{
