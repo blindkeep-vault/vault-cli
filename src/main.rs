@@ -380,6 +380,9 @@ fn main() {
             cmd::auth::run_status(&cli.api_url);
         }
         Some(Command::Put { label, value }) => {
+            if value.is_some() {
+                eprintln!("warning: passing secrets as CLI arguments is visible in process listings; prefer stdin or @file");
+            }
             cmd::secrets::run_put(&client, &cli.api_url, &label, value.as_deref());
         }
         Some(Command::Get { label, output }) => {

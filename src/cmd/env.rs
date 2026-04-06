@@ -261,6 +261,14 @@ pub fn run_env_export(client: &reqwest::blocking::Client, api_url: &str, label: 
     let env_vars = parse_dotenv(blob.secret_value().unwrap_or(""));
 
     for (k, v) in &env_vars {
+        // Validate env var name to prevent shell injection
+        if k.is_empty()
+            || k.starts_with(|c: char| c.is_ascii_digit())
+            || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            eprintln!("warning: skipping invalid env var name: {}", k);
+            continue;
+        }
         // Shell-escape the value: wrap in single quotes, escape existing single quotes
         let escaped = v.replace('\'', "'\\''");
         println!("export {}='{}'", k, escaped);

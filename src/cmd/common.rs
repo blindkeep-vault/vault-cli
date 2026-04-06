@@ -183,7 +183,7 @@ pub fn unwrap_master_key_from_profile(
     })
 }
 
-pub fn parse_api_key(raw_key: &str) -> (String, [u8; 32]) {
+pub fn parse_api_key(raw_key: &str) -> (String, vault_core::Zeroizing<[u8; 32]>) {
     vault_core::unlock::parse_api_key(raw_key).unwrap_or_else(|e| {
         eprintln!("error: {}", e);
         std::process::exit(1);
@@ -377,6 +377,7 @@ pub fn fetch_secrets_full(
     };
 
     let mut secrets = Vec::new();
+    let mut skipped_decrypt = 0usize;
     for item in &items {
         let item_id = item["id"].as_str().unwrap_or("").to_string();
         let wrapped_key = json_to_bytes(&item["wrapped_key"]);
@@ -392,9 +393,13 @@ pub fn fetch_secrets_full(
             &wrap_aad,
         ) {
             Ok(k) => k,
-            Err(_) => continue,
+            Err(_) => {
+                skipped_decrypt += 1;
+                continue;
+            }
         };
         if item_key_plain.len() != 32 {
+            skipped_decrypt += 1;
             continue;
         }
         let mut item_key = [0u8; 32];
@@ -422,6 +427,13 @@ pub fn fetch_secrets_full(
                 serde_json::to_string(item).unwrap_or_default(),
             ));
         }
+    }
+
+    if skipped_decrypt > 0 {
+        eprintln!(
+            "warning: {} item(s) could not be decrypted (key mismatch or corruption)",
+            skipped_decrypt
+        );
     }
 
     secrets

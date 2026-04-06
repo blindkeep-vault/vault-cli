@@ -398,17 +398,16 @@ fn run_daemon(sock: PathBuf, timeout_mins: u64) {
     sig_read.set_nonblocking(true).ok();
     sig_write.set_nonblocking(true).ok();
 
-    // Store the write end in a static for the signal handler
-    static mut SIG_PIPE: Option<std::os::unix::net::UnixStream> = None;
-    unsafe {
-        SIG_PIPE = Some(sig_write);
-    }
+    // Store the write end's fd in an atomic for the signal handler
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static SIG_FD: AtomicI32 = AtomicI32::new(-1);
+    SIG_FD.store(sig_write.as_raw_fd(), Ordering::SeqCst);
+    std::mem::forget(sig_write); // prevent drop so fd stays valid
 
     extern "C" fn handle_signal(_: libc::c_int) {
-        unsafe {
-            if let Some(ref mut pipe) = SIG_PIPE {
-                let _ = pipe.write_all(b"x");
-            }
+        let fd = SIG_FD.load(Ordering::SeqCst);
+        if fd >= 0 {
+            unsafe { libc::write(fd, b"x".as_ptr() as *const libc::c_void, 1) };
         }
     }
 

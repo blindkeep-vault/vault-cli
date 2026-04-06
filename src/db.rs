@@ -58,10 +58,20 @@ impl Database {
     pub fn open(db_path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).ok();
+            }
         }
 
         let blob_dir = db_path.parent().unwrap_or(Path::new(".")).join("blobs");
         std::fs::create_dir_all(&blob_dir).ok();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&blob_dir, std::fs::Permissions::from_mode(0o700)).ok();
+        }
 
         let conn = Connection::open(db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
@@ -435,17 +445,27 @@ impl Database {
         Ok(affected > 0)
     }
 
-    pub fn increment_view_count(&self, id: &str) -> Result<i32, rusqlite::Error> {
+    pub fn increment_view_count(
+        &self,
+        id: &str,
+        max_views: Option<i32>,
+    ) -> Result<Option<i32>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE grants SET view_count = view_count + 1 WHERE id = ?1",
-            params![id],
-        )?;
-        conn.query_row(
-            "SELECT view_count FROM grants WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )
+        if let Some(max) = max_views {
+            conn.query_row(
+                "UPDATE grants SET view_count = view_count + 1 WHERE id = ?1 AND view_count < ?2 RETURNING view_count",
+                params![id, max],
+                |row| row.get(0),
+            )
+            .optional()
+        } else {
+            conn.query_row(
+                "UPDATE grants SET view_count = view_count + 1 WHERE id = ?1 RETURNING view_count",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+        }
     }
 
     pub fn revoke_grant(&self, id: &str, grantor_id: &str) -> Result<bool, rusqlite::Error> {
@@ -491,12 +511,31 @@ impl Database {
 
     pub fn write_blob(&self, key: &str, data: &[u8]) -> std::io::Result<()> {
         let path = self.blob_dir.join(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+            let canonical_parent = parent.canonicalize()?;
+            let canonical_blob_dir = self.blob_dir.canonicalize()?;
+            if !canonical_parent.starts_with(&canonical_blob_dir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "path traversal blocked",
+                ));
+            }
+        }
         std::fs::write(path, data)
     }
 
     pub fn read_blob(&self, key: &str) -> std::io::Result<Vec<u8>> {
         let path = self.blob_dir.join(key);
-        std::fs::read(path)
+        let canonical = path.canonicalize()?;
+        let canonical_blob_dir = self.blob_dir.canonicalize()?;
+        if !canonical.starts_with(&canonical_blob_dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path traversal blocked",
+            ));
+        }
+        std::fs::read(canonical)
     }
 
     // --- Audit ---

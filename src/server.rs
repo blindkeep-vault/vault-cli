@@ -695,7 +695,10 @@ async fn access_grant(
         state.db.claim_grant(&id, &uid)?;
     }
 
-    let new_count = state.db.increment_view_count(&id)?;
+    let new_count = state
+        .db
+        .increment_view_count(&id, policy.max_views)?
+        .ok_or(vault_core::error::ApiError::Forbidden)?;
 
     // Get the item blob
     let item_id = grant
