@@ -118,8 +118,12 @@ pub fn run_get(
         .iter()
         .find(|(_, blob, _)| blob.display_name() == label);
     match found {
-        Some((_, blob, _)) => {
-            if blob.is_file() {
+        Some((_, blob, raw_item)) => {
+            let has_file_blob = serde_json::from_str::<serde_json::Value>(raw_item)
+                .ok()
+                .and_then(|v| v["file_blob_key"].as_str().map(|s| !s.is_empty()))
+                .unwrap_or(false);
+            if blob.is_file() || has_file_blob || blob.filename.is_some() {
                 eprintln!("'{}' is a file:", label);
                 if let Some(f) = &blob.filename {
                     eprintln!("  Filename: {}", f);
