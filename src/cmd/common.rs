@@ -132,7 +132,8 @@ pub fn get_auth(client: &reqwest::blocking::Client, api_url: &str) -> AuthContex
         // Derive key-wrapping key and unwrap the actual master key
         let master_key = unwrap_master_key_from_profile(client, &session, &password_key);
 
-        // Store in agent if one is running
+        // Start agent (if not already running) and cache credentials
+        crate::agent::run_start_quiet(30);
         crate::agent::try_store(
             &session.jwt,
             &master_key,
