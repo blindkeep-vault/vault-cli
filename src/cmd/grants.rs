@@ -477,7 +477,7 @@ pub fn run_grant_create_link(
     let grant_id = body["id"].as_str().unwrap_or("?");
 
     // Build share URL
-    let claim_key_b64 = URL_SAFE_NO_PAD.encode(lg.claim_key);
+    let claim_key_b64 = URL_SAFE_NO_PAD.encode(&*lg.claim_key);
     let base_url = effective_url
         .replace("://api.", "://app.")
         .replace("://localhost:3000", "://localhost:8080");
