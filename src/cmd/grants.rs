@@ -347,37 +347,6 @@ pub fn run_grant_revoke(api_url: &str, grant_id: &str) {
     eprintln!("Grant {} revoked.", grant_id);
 }
 
-fn encrypt_claim_secret(claim_key: &[u8; 32], link_secret: &[u8; 32]) -> Vec<u8> {
-    vault_core::crypto::encrypt_claim_secret(claim_key, link_secret).unwrap_or_else(|e| {
-        eprintln!("error encrypting claim secret: {}", e);
-        std::process::exit(1);
-    })
-}
-
-fn decrypt_claim_secret(claim_key: &[u8; 32], claim_ciphertext: &[u8]) -> [u8; 32] {
-    vault_core::crypto::decrypt_claim_secret(claim_key, claim_ciphertext).unwrap_or_else(|e| {
-        eprintln!("error decrypting claim secret: {}", e);
-        std::process::exit(1);
-    })
-}
-
-/// Parse a grant-accept URL: /#/grant-accept/{id}/{secret} or full URL
-fn parse_grant_url(url: &str) -> Option<(String, String)> {
-    // Try: .../grant-accept/{id}/{secret}
-    if let Some(idx) = url.find("/grant-accept/") {
-        let rest = &url[idx + 14..];
-        let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            let secret = parts[1]
-                .split(&['?', '#', '&'][..])
-                .next()
-                .unwrap_or(parts[1]);
-            return Some((parts[0].to_string(), secret.to_string()));
-        }
-    }
-    None
-}
-
 pub fn run_grant_create_link(
     client: &reqwest::blocking::Client,
     api_url: &str,
@@ -428,26 +397,39 @@ pub fn run_grant_create_link(
                 std::process::exit(1);
             });
 
-    // Generate random link_secret
-    let mut link_secret = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut link_secret);
+    // Optionally decrypt file key if item has a file blob
+    let has_file_blob = item["file_blob_key"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty());
+    let file_key = if has_file_blob {
+        let file_wk = json_to_bytes(&item["file_wrapped_key"]);
+        let file_nonce = json_to_bytes(&item["file_nonce"]);
+        if !file_wk.is_empty() && !file_nonce.is_empty() {
+            Some(
+                vault_core::client::unwrap_owned_item_key(
+                    master_key,
+                    &user_id,
+                    &file_wk,
+                    &file_nonce,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("error decrypting file key: {}", e);
+                    std::process::exit(1);
+                }),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    // Wrap item_key with link_secret (no AAD initially; AAD added after we know grant_id)
-    let ls_wrapped = vault_core::crypto::encrypt_item_v1(&link_secret, &item_key, b"")
-        .unwrap_or_else(|e| {
-            eprintln!("error wrapping key with link-secret: {}", e);
+    // Use consolidated link-secret grant preparation
+    let lg =
+        vault_core::client::prepare_link_grant(&item_key, file_key.as_ref()).unwrap_or_else(|e| {
+            eprintln!("error preparing link grant: {}", e);
             std::process::exit(1);
         });
-
-    // Generate claim_key and encrypt link_secret
-    let mut claim_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut claim_key);
-    let claim_ciphertext = encrypt_claim_secret(&claim_key, &link_secret);
-
-    // Hash claim_key for server-side lookup
-    let mut hasher = Sha256::new();
-    hasher.update(claim_key);
-    let claim_token_hash = hex::encode(hasher.finalize());
 
     // Build policy
     let allowed_ops = if read_only {
@@ -477,43 +459,15 @@ pub fn run_grant_create_link(
     let mut grant_body = serde_json::json!({
         "item_id": item_id,
         "grantee_email": grantee_email,
-        "wrapped_key": ls_wrapped.ciphertext,
+        "wrapped_key": lg.wrapped_key,
         "ephemeral_pubkey": [],
         "policy": policy,
-        "claim_token_hash": claim_token_hash,
-        "claim_ciphertext": claim_ciphertext,
+        "claim_token_hash": lg.claim_token_hash,
+        "claim_ciphertext": lg.claim_ciphertext,
     });
 
-    // Handle file_wrapped_key if item has one
-    let has_file_blob = item["file_blob_key"]
-        .as_str()
-        .is_some_and(|s| !s.is_empty());
-    if has_file_blob {
-        // Decrypt the file_wrapped_key, then re-wrap with link_secret
-        let file_wk = json_to_bytes(&item["file_wrapped_key"]);
-        let file_nonce = json_to_bytes(&item["file_nonce"]);
-        if !file_wk.is_empty() && !file_nonce.is_empty() {
-            let file_key = vault_core::client::unwrap_owned_item_key(
-                master_key,
-                &user_id,
-                &file_wk,
-                &file_nonce,
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("error decrypting file key: {}", e);
-                std::process::exit(1);
-            });
-            let file_key_plain = vault_core::Zeroizing::new(file_key.to_vec());
-            // Wrap file key with link_secret: nonce(24) + ciphertext
-            let file_enc = encrypt_item(&link_secret, &file_key_plain).unwrap_or_else(|e| {
-                eprintln!("error wrapping file key: {}", e);
-                std::process::exit(1);
-            });
-            let mut file_wrapped: Vec<u8> = Vec::with_capacity(24 + file_enc.ciphertext.len());
-            file_wrapped.extend_from_slice(&file_enc.nonce);
-            file_wrapped.extend_from_slice(&file_enc.ciphertext);
-            grant_body["file_wrapped_key"] = serde_json::json!(file_wrapped);
-        }
+    if let Some(fwk) = &lg.file_wrapped_key {
+        grant_body["file_wrapped_key"] = serde_json::json!(fwk);
     }
 
     let body: serde_json::Value = vc
@@ -523,7 +477,7 @@ pub fn run_grant_create_link(
     let grant_id = body["id"].as_str().unwrap_or("?");
 
     // Build share URL
-    let claim_key_b64 = URL_SAFE_NO_PAD.encode(claim_key);
+    let claim_key_b64 = URL_SAFE_NO_PAD.encode(lg.claim_key);
     let base_url = effective_url
         .replace("://api.", "://app.")
         .replace("://localhost:3000", "://localhost:8080");
@@ -551,8 +505,8 @@ pub fn run_grant_access_link(
     output: Option<PathBuf>,
 ) {
     // Parse grant_id and claim_key from URL or args
-    let (grant_id, claim_key_b64) = if let Some((id, secret)) = parse_grant_url(url) {
-        (id, secret)
+    let (grant_id, claim_key_b64) = if let Some(gl) = vault_core::parsing::parse_grant_url(url) {
+        (gl.grant_id, gl.claim_key_b64)
     } else if uuid::Uuid::parse_str(url).is_ok() {
         let k = key_arg.unwrap_or_else(|| {
             eprintln!("error: provide a grant URL or grant ID with --key");
@@ -576,9 +530,8 @@ pub fn run_grant_access_link(
     claim_key.copy_from_slice(&claim_key_bytes);
 
     // Hash claim_key for server lookup
-    let mut hasher = Sha256::new();
-    hasher.update(claim_key);
-    let token_hash = hex::encode(hasher.finalize());
+    use sha2::{Digest, Sha256};
+    let token_hash = hex::encode(Sha256::digest(claim_key));
 
     let vc = VaultClient::new(api_url, "");
 
@@ -596,79 +549,49 @@ pub fn run_grant_access_link(
 
     let grant: serde_json::Value = preview_resp.json().expect("invalid JSON");
 
-    // Decrypt claim_ciphertext to get link_secret
+    // Decrypt using consolidated link-grant flow
     let claim_ct = json_to_bytes(&grant["claim_ciphertext"]);
-    let link_secret = decrypt_claim_secret(&claim_key, &claim_ct);
-
-    // Decrypt item key using link_secret
     let grant_wrapped_key = json_to_bytes(&grant["wrapped_key"]);
-    if grant_wrapped_key.len() < 25 {
-        eprintln!("error: grant wrapped_key too short");
-        std::process::exit(1);
-    }
-
-    // wrapped_key format: the server stores it as ciphertext only; nonce is separate
-    // But for link-secret grants from the web UI, wrapped_key is just the ciphertext
-    // and nonce is stored separately
     let grant_nonce = json_to_bytes(&grant["nonce"]);
-    let item_key_plain =
-        vault_core::crypto::decrypt_item_auto(&link_secret, &grant_wrapped_key, &grant_nonce, b"")
-            .unwrap_or_else(|e| {
-                eprintln!("error decrypting item key: {}", e);
-                std::process::exit(1);
-            });
-    let mut item_key = [0u8; 32];
-    item_key.copy_from_slice(&item_key_plain);
-
-    // Decrypt the blob
     let encrypted_blob_b64 = grant["encrypted_blob"].as_str().unwrap_or("");
     let blob_data = STANDARD.decode(encrypted_blob_b64).unwrap_or_else(|e| {
         eprintln!("error decoding blob: {}", e);
         std::process::exit(1);
     });
-    if blob_data.len() < 25 {
-        eprintln!("error: encrypted blob too short");
-        std::process::exit(1);
-    }
-
     let grantor_id = grant["grantor_id"].as_str().unwrap_or("");
 
-    let plaintext = vault_core::envelope::decrypt_blob_bytes(&blob_data, &item_key, grantor_id)
-        .unwrap_or_else(|e| {
-            eprintln!("error decrypting grant content: {}", e);
-            std::process::exit(1);
-        });
+    let blob = vault_core::client::decrypt_link_grant(
+        &claim_key,
+        &claim_ct,
+        &grant_wrapped_key,
+        &grant_nonce,
+        &blob_data,
+        grantor_id,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error decrypting grant content: {}", e);
+        std::process::exit(1);
+    });
 
     // Output
-    if let Ok(blob) = serde_json::from_slice::<SecretBlob>(&plaintext) {
+    if let Some(val) = blob.secret_value() {
         if let Some(path) = output {
-            std::fs::write(&path, blob.secret_value().unwrap_or("")).unwrap_or_else(|e| {
+            std::fs::write(&path, val).unwrap_or_else(|e| {
                 eprintln!("error writing {}: {}", path.display(), e);
                 std::process::exit(1);
             });
             eprintln!("Written to {}", path.display());
         } else {
-            print!("{}", blob.secret_value().unwrap_or(""));
-        }
-    } else if let Ok(text) = std::str::from_utf8(&plaintext) {
-        if let Some(path) = output {
-            std::fs::write(&path, text).unwrap_or_else(|e| {
-                eprintln!("error writing {}: {}", path.display(), e);
-                std::process::exit(1);
-            });
-            eprintln!("Written to {}", path.display());
-        } else {
-            print!("{}", text);
+            print!("{}", val);
         }
     } else if let Some(path) = output {
-        std::fs::write(&path, &*plaintext).unwrap_or_else(|e| {
+        std::fs::write(&path, blob.display_name()).unwrap_or_else(|e| {
             eprintln!("error writing {}: {}", path.display(), e);
             std::process::exit(1);
         });
         eprintln!("Written to {}", path.display());
     } else {
-        eprintln!("error: grant content is binary (use -o to save to file)");
-        std::process::exit(1);
+        print!("{}", blob.display_name());
     }
 }
 

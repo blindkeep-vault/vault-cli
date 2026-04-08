@@ -555,16 +555,7 @@ pub(crate) enum WillAction {
     Delete,
 }
 
-pub(crate) enum ParsedInput {
-    Direct {
-        drop_id: String,
-        key: [u8; 32],
-    },
-    Mnemonic {
-        mnemonic: String,
-        drop_id: Option<String>,
-    },
-}
+pub(crate) type ParsedInput = vault_core::parsing::DropInput;
 
 fn main() {
     let cli = Cli::parse();

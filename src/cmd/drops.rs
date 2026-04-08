@@ -10,10 +10,10 @@ pub fn run_drop_download(
     let parsed = parse_input(key, key2);
 
     match parsed {
-        crate::ParsedInput::Direct { drop_id, key } => {
+        vault_core::parsing::DropInput::Direct { drop_id, key } => {
             download_drop(api_url, &drop_id, &key, output);
         }
-        crate::ParsedInput::Mnemonic { mnemonic, drop_id } => {
+        vault_core::parsing::DropInput::Mnemonic { mnemonic, drop_id } => {
             let vc = VaultClient::new(api_url, "");
 
             let resolved_id = match drop_id {
@@ -66,152 +66,10 @@ pub fn run_drop_download(
 }
 
 pub fn parse_input(key: &str, key2: Option<&str>) -> crate::ParsedInput {
-    let input = key.trim();
-
-    if let Some(k2) = key2 {
-        let k2 = k2.trim();
-        if looks_like_uuid(input) {
-            if let Some(key_bytes) = try_decode_base64url(k2) {
-                return crate::ParsedInput::Direct {
-                    drop_id: input.to_string(),
-                    key: key_bytes,
-                };
-            }
-        }
-        if looks_like_uuid(k2) {
-            if let Some(key_bytes) = try_decode_base64url(input) {
-                return crate::ParsedInput::Direct {
-                    drop_id: k2.to_string(),
-                    key: key_bytes,
-                };
-            }
-        }
-        let combined = format!("{} {}", input, k2);
-        return parse_input(&combined, None);
-    }
-
-    if let Some(caps) = extract_drop_url(input) {
-        return crate::ParsedInput::Direct {
-            drop_id: caps.0,
-            key: caps.1,
-        };
-    }
-
-    if let Some(slug) = extract_pickup_slug(input) {
-        let mnemonic = slug.replace('-', " ");
-        return crate::ParsedInput::Mnemonic {
-            mnemonic: normalize_mnemonic(&mnemonic),
-            drop_id: None,
-        };
-    }
-
-    if extract_pickup_uuid(input).is_some() {
-        eprintln!("error: pickup URL with UUID requires a mnemonic — provide the 12 words instead");
+    vault_core::parsing::parse_drop_input(key, key2).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
         std::process::exit(1);
-    }
-
-    let hyphen_words: Vec<&str> = input.split('-').collect();
-    if hyphen_words.len() == 12
-        && hyphen_words
-            .iter()
-            .all(|w| w.chars().all(|c| c.is_ascii_lowercase()))
-    {
-        return crate::ParsedInput::Mnemonic {
-            mnemonic: hyphen_words.join(" "),
-            drop_id: None,
-        };
-    }
-
-    let space_words: Vec<&str> = input.split_whitespace().collect();
-    if space_words.len() == 12
-        && space_words
-            .iter()
-            .all(|w| w.chars().all(|c| c.is_ascii_alphabetic()))
-    {
-        return crate::ParsedInput::Mnemonic {
-            mnemonic: normalize_mnemonic(input),
-            drop_id: None,
-        };
-    }
-
-    if looks_like_uuid(input) {
-        eprintln!(
-            "error: drop UUID provided without a key — provide a base64url key as second argument"
-        );
-        std::process::exit(1);
-    }
-
-    if try_decode_base64url(input).is_some() {
-        eprintln!("error: base64url key provided without a drop UUID");
-        std::process::exit(1);
-    }
-
-    eprintln!("error: could not parse input as a drop URL, BIP39 mnemonic, or UUID + key");
-    std::process::exit(1);
-}
-
-pub fn looks_like_uuid(s: &str) -> bool {
-    uuid::Uuid::parse_str(s).is_ok()
-}
-
-pub fn try_decode_base64url(s: &str) -> Option<[u8; 32]> {
-    let bytes = URL_SAFE_NO_PAD.decode(s).ok()?;
-    if bytes.len() == 32 {
-        Some(bytes.try_into().unwrap())
-    } else {
-        None
-    }
-}
-
-pub fn extract_drop_url(s: &str) -> Option<(String, [u8; 32])> {
-    let drop_idx = s.find("/drop/")?;
-    let rest = &s[drop_idx + 6..];
-    let uuid_end = rest.find('?').unwrap_or(rest.len());
-    let uuid_str = &rest[..uuid_end];
-    if !looks_like_uuid(uuid_str) {
-        return None;
-    }
-    let key_start = rest.find("key=")?;
-    let key_str = &rest[key_start + 4..];
-    let key_end = key_str.find('&').unwrap_or(key_str.len());
-    let key_str = &key_str[..key_end];
-    let key = try_decode_base64url(key_str)?;
-    Some((uuid_str.to_string(), key))
-}
-
-pub fn extract_pickup_slug(s: &str) -> Option<String> {
-    let idx = s.find("/pickup/")?;
-    let rest = &s[idx + 8..];
-    let slug = rest
-        .split(&['?', '&', '#'][..])
-        .next()
-        .unwrap_or(rest)
-        .trim();
-    let words: Vec<&str> = slug.split('-').collect();
-    if words.len() == 12
-        && words
-            .iter()
-            .all(|w| w.chars().all(|c| c.is_ascii_lowercase()))
-    {
-        Some(slug.to_string())
-    } else {
-        None
-    }
-}
-
-pub fn extract_pickup_uuid(s: &str) -> Option<String> {
-    let idx = s.find("/pickup/")?;
-    let rest = &s[idx + 8..];
-    let id = rest
-        .split(&['?', '&', '#'][..])
-        .next()
-        .unwrap_or(rest)
-        .trim();
-    if looks_like_uuid(id) {
-        Some(id.to_string())
-    } else {
-        None
-    }
+    })
 }
 
 pub fn download_drop(api_url: &str, drop_id: &str, key: &[u8; 32], output: Option<PathBuf>) {
@@ -230,10 +88,11 @@ pub fn download_drop(api_url: &str, drop_id: &str, key: &[u8; 32], output: Optio
     let ciphertext = &encrypted[24..];
 
     eprintln!("Decrypting...");
-    let padded = decrypt_item(key, ciphertext, nonce).unwrap_or_else(|e| {
-        eprintln!("error: decryption failed: {}", e);
-        std::process::exit(1);
-    });
+    let padded = vault_core::crypto::decrypt_item_auto(key, ciphertext, nonce, b"drop-blob")
+        .unwrap_or_else(|e| {
+            eprintln!("error: decryption failed: {}", e);
+            std::process::exit(1);
+        });
 
     let plain = unpad(&padded);
     let (filename, file_data) = parse_envelope(plain, drop_id);
@@ -252,8 +111,8 @@ pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, k
 
     // Resolve the drop key (32 bytes) and drop ID
     let (drop_id, drop_key) = match parsed {
-        crate::ParsedInput::Direct { drop_id, key } => (drop_id, key),
-        crate::ParsedInput::Mnemonic { mnemonic, drop_id } => {
+        vault_core::parsing::DropInput::Direct { drop_id, key } => (drop_id, key),
+        vault_core::parsing::DropInput::Mnemonic { mnemonic, drop_id } => {
             let resolved_id = match drop_id {
                 Some(id) => id,
                 None => {
@@ -386,9 +245,10 @@ pub fn run_drop_upload(
     let mut drop_key = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut drop_key);
 
-    let enc = encrypt_item(&drop_key, &padded).expect("encryption failed");
+    let enc = vault_core::crypto::encrypt_item_v1(&drop_key, &padded, b"drop-blob")
+        .expect("encryption failed");
 
-    // Build blob: nonce(24) + ciphertext
+    // Build blob: nonce(24) + V1 ciphertext
     let mut blob = Vec::with_capacity(24 + enc.ciphertext.len());
     blob.extend_from_slice(&enc.nonce);
     blob.extend_from_slice(&enc.ciphertext);

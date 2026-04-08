@@ -92,27 +92,14 @@ fn build_will_payload(
     }
     eprintln!("Including {} item(s) in will.", selected_items.len());
 
-    // Generate will key
-    let mut will_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut will_key);
-
-    // Wrap each item key with will_key
-    let mut wrapped_items = serde_json::Map::new();
-    for (item_id, item_key) in &selected_items {
-        let will_aad = format!("will:{}", user_id);
-        let wrapped = vault_core::crypto::encrypt_item_v1(&will_key, item_key, will_aad.as_bytes())
-            .unwrap_or_else(|e| {
-                eprintln!("error wrapping item key for will: {}", e);
-                std::process::exit(1);
-            });
-        wrapped_items.insert(
-            item_id.clone(),
-            serde_json::json!({
-                "wrapped_key": wrapped.ciphertext,
-                "nonce": wrapped.nonce.to_vec(),
-            }),
-        );
-    }
+    // Convert to WillItemKey format for vault-core
+    let will_items: Vec<vault_core::client::WillItemKey> = selected_items
+        .iter()
+        .map(|(id, key)| vault_core::client::WillItemKey {
+            item_id: id.clone(),
+            item_key: *key,
+        })
+        .collect();
 
     // Try to fetch heir's public key (may 404 if heir has no account)
     let pk_resp = vc.get_query_raw("/users/public-key", &[("email", heir_email)]);
@@ -125,43 +112,33 @@ fn build_will_payload(
             std::process::exit(1);
         });
 
-        // Wrap will_key for heir using X25519
-        let will_grant =
-            vault_core::client::prepare_grant(&will_key, &heir_pubkey).unwrap_or_else(|e| {
-                eprintln!("error wrapping will key: {}", e);
+        let payload = vault_core::client::prepare_will_payload(&user_id, &will_items, &heir_pubkey)
+            .unwrap_or_else(|e| {
+                eprintln!("error preparing will payload: {}", e);
                 std::process::exit(1);
             });
-        let encrypted_will_key = will_grant.grant_wrapped_key;
-        let ephemeral_pubkey = will_grant.ephemeral_pubkey;
 
         serde_json::json!({
             "heir_email": heir_email,
-            "encrypted_will_key": encrypted_will_key,
-            "ephemeral_pubkey": ephemeral_pubkey.to_vec(),
-            "wrapped_items": wrapped_items,
+            "encrypted_will_key": payload.encrypted_will_key,
+            "ephemeral_pubkey": payload.ephemeral_pubkey.to_vec(),
+            "wrapped_items": payload.wrapped_items,
             "grace_days": grace_days,
             "will_key_version": 2,
         })
     } else {
-        // Heir not on platform — use link-secret / passphrase flow
+        // Heir not on platform — use mnemonic flow
         eprintln!("Heir does not have a BlindKeep account. Generating passphrase...");
 
-        let mnemonic = generate_bip39_mnemonic();
-        let wrapping_key = derive_drop_wrapping_key(&mnemonic, 2);
-        let lookup_key = derive_drop_lookup_key(&mnemonic);
-
-        // Encrypt will_key with wrapping_key
-        let enc = encrypt_item(&wrapping_key, &will_key).unwrap_or_else(|e| {
-            eprintln!("error encrypting will key: {}", e);
-            std::process::exit(1);
-        });
-        let mut encrypted_will_key = Vec::with_capacity(24 + enc.ciphertext.len());
-        encrypted_will_key.extend_from_slice(&enc.nonce);
-        encrypted_will_key.extend_from_slice(&enc.ciphertext);
+        let payload = vault_core::client::prepare_will_payload_mnemonic(&user_id, &will_items)
+            .unwrap_or_else(|e| {
+                eprintln!("error preparing will payload: {}", e);
+                std::process::exit(1);
+            });
 
         eprintln!();
         eprintln!("IMPORTANT: Share this passphrase with your heir securely:");
-        let words: Vec<&str> = mnemonic.split_whitespace().collect();
+        let words: Vec<&str> = payload.mnemonic.split_whitespace().collect();
         for (i, word) in words.iter().enumerate() {
             eprint!("  {:>2}. {:<12}", i + 1, word);
             if (i + 1) % 4 == 0 {
@@ -174,11 +151,11 @@ fn build_will_payload(
 
         serde_json::json!({
             "heir_email": heir_email,
-            "encrypted_will_key": encrypted_will_key,
+            "encrypted_will_key": payload.encrypted_will_key,
             "ephemeral_pubkey": [],
-            "wrapped_items": wrapped_items,
+            "wrapped_items": payload.wrapped_items,
             "grace_days": grace_days,
-            "lookup_key": lookup_key,
+            "lookup_key": payload.lookup_key,
             "will_key_version": 2,
         })
     }
