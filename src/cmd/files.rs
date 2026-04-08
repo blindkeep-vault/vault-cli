@@ -37,68 +37,18 @@ pub fn run_file_put(
     };
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let blob_aad = format!("item:{}", user_id);
-    let wrap_aad_str = format!("wrap:{}", user_id);
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
+
+    eprintln!("Encrypting {}...", file_name);
+    let prepared = vault_core::client::prepare_file_item(
+        master_key, &user_id, label, &file_name, &mime_type, &file_data,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error encrypting file: {}", e);
         std::process::exit(1);
     });
 
-    // Encrypt file data with its own key (pad to hide size, same AAD as web UI: "item:{user_id}")
-    eprintln!("Encrypting {}...", file_name);
-    let mut file_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut file_key);
-
-    let padded = pad_plaintext(&file_data);
-    let enc_file = vault_core::crypto::encrypt_item_v1(&file_key, &padded, blob_aad.as_bytes())
-        .unwrap_or_else(|e| {
-            eprintln!("error encrypting file: {}", e);
-            std::process::exit(1);
-        });
-    let mut file_blob = Vec::with_capacity(1 + 24 + enc_file.ciphertext.len());
-    file_blob.push(0x01);
-    file_blob.extend_from_slice(&enc_file.nonce);
-    file_blob.extend_from_slice(&enc_file.ciphertext);
-
-    // Wrap file key with enc_subkey (stored inside envelope)
-    let file_wrapped =
-        vault_core::crypto::encrypt_item_v1(&enc_key, &file_key, wrap_aad_str.as_bytes())
-            .unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            });
-
-    // Build metadata envelope (matches web UI format)
-    let blob = SecretBlob {
-        name: label.to_string(),
-        content: None,
-        label: None,
-        item_type: Some("document".into()),
-        value: None,
-        filename: Some(file_name.clone()),
-        mime_type: Some(mime_type),
-        file_size: Some(file_data.len() as u64),
-        file_wrapped_key: Some(file_wrapped.ciphertext.to_vec()),
-        file_nonce: Some(file_wrapped.nonce.to_vec()),
-    };
-    let blob_json = serde_json::to_vec(&blob).expect("serialize blob");
-
-    // Encrypt envelope with its own key
-    let mut envelope_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut envelope_key);
-
-    let padded_envelope = pad_plaintext(&blob_json);
-    let enc_blob =
-        vault_core::crypto::encrypt_item_v1(&envelope_key, &padded_envelope, blob_aad.as_bytes())
-            .unwrap_or_else(|e| {
-                eprintln!("error encrypting envelope: {}", e);
-                std::process::exit(1);
-            });
-    let mut blob_data = Vec::with_capacity(1 + 24 + enc_blob.ciphertext.len());
-    blob_data.push(0x01);
-    blob_data.extend_from_slice(&enc_blob.nonce);
-    blob_data.extend_from_slice(&enc_blob.ciphertext);
-    let envelope_b64 = STANDARD.encode(&blob_data);
+    let file_blob = prepared.encrypted_file;
+    let envelope_b64 = prepared.envelope_b64.clone();
     let file_blob_len = file_blob.len();
 
     // Get presigned upload URL
@@ -161,22 +111,14 @@ pub fn run_file_put(
         }
     }
 
-    // Wrap envelope key with encryption subkey
-    let wrapped =
-        vault_core::crypto::encrypt_item_v1(&enc_key, &envelope_key, wrap_aad_str.as_bytes())
-            .unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            });
-
     // Create item with envelope inline + file blob reference
     let resp = client
         .post(format!("{}/items", auth.api_url()))
         .header("Authorization", format!("Bearer {}", auth.jwt()))
         .json(&serde_json::json!({
             "encrypted_blob": envelope_b64,
-            "wrapped_key": wrapped.ciphertext,
-            "nonce": wrapped.nonce.to_vec(),
+            "wrapped_key": prepared.wrapped_key,
+            "nonce": prepared.nonce.to_vec(),
             "item_type": "encrypted",
             "file_blob_key": s3_key,
             "size_bytes": file_blob_len,
@@ -205,18 +147,12 @@ pub fn run_file_get(
     let auth = get_auth(client, api_url);
 
     // Find the file item by listing and decrypting envelopes
-    let (jwt, enc_key, user_id) = match &auth {
+    let (jwt, master_key, user_id) = match &auth {
         AuthContext::Full {
-            jwt,
-            master_key,
-            api_url: _,
+            jwt, master_key, ..
         } => {
             let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-            let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            });
-            (jwt.clone(), enc_key, user_id)
+            (jwt.clone(), master_key, user_id)
         }
         AuthContext::Scoped { .. } => {
             eprintln!("error: file get is not supported with scoped API keys");
@@ -241,17 +177,6 @@ pub fn run_file_get(
 
     let items: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
 
-    let wrap_aad = if user_id.is_empty() {
-        Vec::new()
-    } else {
-        format!("wrap:{}", user_id).into_bytes()
-    };
-    let blob_aad = if user_id.is_empty() {
-        Vec::new()
-    } else {
-        format!("item:{}", user_id).into_bytes()
-    };
-
     // Find matching file item and keep its item_key
     let mut found: Option<(String, SecretBlob, [u8; 32])> = None;
     for item in &items {
@@ -262,20 +187,15 @@ pub fn run_file_get(
             continue;
         }
 
-        let item_key_plain = match vault_core::crypto::decrypt_item_auto(
-            &enc_key,
+        let item_key = match vault_core::client::unwrap_owned_item_key(
+            master_key,
+            &user_id,
             &wrapped_key,
             &nonce,
-            &wrap_aad,
         ) {
             Ok(k) => k,
             Err(_) => continue,
         };
-        if item_key_plain.len() != 32 {
-            continue;
-        }
-        let mut item_key = [0u8; 32];
-        item_key.copy_from_slice(&item_key_plain);
 
         // Decrypt the inline envelope
         let enc_blob_str = item["encrypted_blob"].as_str().unwrap_or("");
@@ -287,19 +207,11 @@ pub fn run_file_get(
             continue;
         }
 
-        let decrypted = if blob_data[0] == 0x01 && blob_data.len() > 25 {
-            let n = &blob_data[1..25];
-            let ct = &blob_data[25..];
-            vault_core::crypto::decrypt_item_auto(&item_key, ct, n, &blob_aad)
-                .or_else(|_| decrypt_item(&item_key, &blob_data[24..], &blob_data[..24]))
-                .ok()
-        } else {
-            decrypt_item(&item_key, &blob_data[24..], &blob_data[..24]).ok()
-        };
-
-        let Some(decrypted) = decrypted else {
-            continue;
-        };
+        let decrypted =
+            match vault_core::envelope::decrypt_blob_bytes(&blob_data, &item_key, &user_id) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
 
         // Envelope may be padded (web UI pads it)
         let envelope_bytes = unpad(&decrypted);
@@ -324,18 +236,12 @@ pub fn run_file_get(
 
     // Unwrap the file key from the envelope (or fall back to the envelope key)
     let file_key = if let (Some(fwk), Some(fn_)) = (&blob.file_wrapped_key, &blob.file_nonce) {
-        let fk_plain = vault_core::crypto::decrypt_item_auto(&enc_key, fwk, fn_, &wrap_aad)
-            .unwrap_or_else(|e| {
+        vault_core::client::unwrap_owned_item_key(master_key, &user_id, fwk, fn_).unwrap_or_else(
+            |e| {
                 eprintln!("error unwrapping file key: {}", e);
                 std::process::exit(1);
-            });
-        if fk_plain.len() != 32 {
-            eprintln!("error: invalid file key length");
-            std::process::exit(1);
-        }
-        let mut fk = [0u8; 32];
-        fk.copy_from_slice(&fk_plain);
-        fk
+            },
+        )
     } else {
         _envelope_key
     };
@@ -362,23 +268,12 @@ pub fn run_file_get(
     // Try base64 decode (S3 may return base64-encoded data)
     let file_blob_data = STANDARD.decode(&raw).unwrap_or(raw);
 
-    if file_blob_data.len() < 25 {
-        eprintln!("error: file blob too small");
-        std::process::exit(1);
-    }
-
-    // Decrypt file blob (V1 format, AAD = "item:{user_id}" matching web UI)
-    let decrypted = if file_blob_data[0] == 0x01 && file_blob_data.len() > 25 {
-        let n = &file_blob_data[1..25];
-        let ct = &file_blob_data[25..];
-        vault_core::crypto::decrypt_item_auto(&file_key, ct, n, &blob_aad)
-    } else {
-        decrypt_item(&file_key, &file_blob_data[24..], &file_blob_data[..24])
-    }
-    .unwrap_or_else(|e| {
-        eprintln!("error decrypting file: {}", e);
-        std::process::exit(1);
-    });
+    // Decrypt file blob
+    let decrypted = vault_core::envelope::decrypt_blob_bytes(&file_blob_data, &file_key, &user_id)
+        .unwrap_or_else(|e| {
+            eprintln!("error decrypting file: {}", e);
+            std::process::exit(1);
+        });
 
     // Unpad to get original file bytes
     let file_bytes = unpad(&decrypted);

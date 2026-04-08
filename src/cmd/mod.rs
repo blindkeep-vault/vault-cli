@@ -25,9 +25,9 @@ pub use sha2::{Digest, Sha256};
 pub use std::io::{Read as IoRead, Write};
 pub use std::path::PathBuf;
 pub use vault_core::crypto::{
-    decrypt_item, decrypt_private_key, derive_api_key_keys, derive_master_key, derive_subkey,
-    encrypt_item, generate_x25519_keypair, unwrap_grant_key, unwrap_key, unwrap_master_key,
-    wrap_key_for_grant, wrap_key_for_recipient, wrap_master_key, MasterKey,
+    decrypt_item, derive_api_key_keys, derive_master_key, derive_subkey, encrypt_item,
+    generate_x25519_keypair, unwrap_grant_key, unwrap_key, unwrap_master_key, wrap_master_key,
+    MasterKey,
 };
 pub use vault_core::drops::{
     derive_drop_lookup_key, derive_drop_wrapping_key, generate_bip39_mnemonic, normalize_mnemonic,

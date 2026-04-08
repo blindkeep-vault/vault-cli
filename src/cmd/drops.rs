@@ -329,15 +329,10 @@ pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, k
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
 
     // Wrap the drop key under our enc_key (V1 with AAD)
-    let wrap_aad = format!("wrap:{}", user_id);
-    let wrapped = vault_core::crypto::encrypt_item_v1(&enc_key, &drop_key, wrap_aad.as_bytes())
+    let wrapped = vault_core::client::wrap_key_for_user(master_key, &user_id, &drop_key)
         .unwrap_or_else(|e| {
             eprintln!("error wrapping key: {}", e);
             std::process::exit(1);
@@ -348,7 +343,7 @@ pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, k
         .post(format!("{}/drops/{}/claim", auth.api_url(), drop_id))
         .header("Authorization", format!("Bearer {}", auth.jwt()))
         .json(&serde_json::json!({
-            "wrapped_key": wrapped.ciphertext,
+            "wrapped_key": wrapped.wrapped_key,
             "nonce": wrapped.nonce.to_vec(),
         }))
         .send()

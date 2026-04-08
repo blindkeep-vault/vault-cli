@@ -15,46 +15,22 @@ pub fn run_group(client: &reqwest::blocking::Client, api_url: &str, action: crat
     }
 }
 
-fn encrypt_group_blob(name: &str, enc_key: &[u8; 32], user_id: &str) -> (String, Vec<u8>, Vec<u8>) {
-    let blob_json = serde_json::json!({ "name": name }).to_string();
-
-    // Generate random group key
-    let mut group_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut group_key);
-
-    // Encrypt blob with group key
-    let blob_aad = format!("group:{}", user_id);
-    let enc_blob =
-        vault_core::crypto::encrypt_item_v1(&group_key, blob_json.as_bytes(), blob_aad.as_bytes())
-            .unwrap_or_else(|e| {
-                eprintln!("error encrypting group: {}", e);
-                std::process::exit(1);
-            });
-
-    let mut blob_data = Vec::with_capacity(1 + 24 + enc_blob.ciphertext.len());
-    blob_data.push(0x01);
-    blob_data.extend_from_slice(&enc_blob.nonce);
-    blob_data.extend_from_slice(&enc_blob.ciphertext);
-    let blob_b64 = STANDARD.encode(&blob_data);
-
-    // Wrap group key with enc_key
-    let wrap_aad = format!("wrap:{}", user_id);
-    let wrapped = vault_core::crypto::encrypt_item_v1(enc_key, &group_key, wrap_aad.as_bytes())
-        .unwrap_or_else(|e| {
-            eprintln!("error wrapping group key: {}", e);
+fn encrypt_group_blob(
+    master_key: &MasterKey,
+    user_id: &str,
+    name: &str,
+) -> (String, Vec<u8>, Vec<u8>) {
+    let (blob_b64, wrapped_key, nonce) =
+        vault_core::client::encrypt_group(master_key, user_id, name).unwrap_or_else(|e| {
+            eprintln!("error encrypting group: {}", e);
             std::process::exit(1);
         });
-
-    (
-        blob_b64,
-        wrapped.ciphertext.to_vec(),
-        wrapped.nonce.to_vec(),
-    )
+    (blob_b64, wrapped_key, nonce.to_vec())
 }
 
-fn decrypt_group_name(
+fn decrypt_group_name_from_json(
     group: &serde_json::Value,
-    enc_key: &[u8; 32],
+    master_key: &MasterKey,
     user_id: &str,
 ) -> Option<String> {
     let wrapped_key = json_to_bytes(&group["wrapped_key"]);
@@ -62,44 +38,16 @@ fn decrypt_group_name(
     if wrapped_key.is_empty() || nonce.is_empty() {
         return None;
     }
-
-    let wrap_aad = format!("wrap:{}", user_id);
-    let group_key_plain =
-        vault_core::crypto::decrypt_item_auto(enc_key, &wrapped_key, &nonce, wrap_aad.as_bytes())
-            .ok()?;
-    if group_key_plain.len() != 32 {
-        return None;
-    }
-    let mut group_key = [0u8; 32];
-    group_key.copy_from_slice(&group_key_plain);
-
     let blob_b64 = group["encrypted_blob"].as_str()?;
-    let blob_data = STANDARD.decode(blob_b64).ok()?;
-    if blob_data.is_empty() {
-        return None;
-    }
 
-    let blob_aad = format!("group:{}", user_id);
-    let plaintext = if blob_data[0] == 0x01 && blob_data.len() > 25 {
-        let nonce = &blob_data[1..25];
-        let ciphertext = &blob_data[25..];
-        vault_core::crypto::decrypt_item_auto(&group_key, ciphertext, nonce, blob_aad.as_bytes())
-            .ok()?
-    } else if blob_data.len() > 24 {
-        decrypt_item(&group_key, &blob_data[24..], &blob_data[..24]).ok()?
-    } else {
-        return None;
-    };
-
-    let parsed: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
-    parsed["name"].as_str().map(|s| s.to_string())
+    vault_core::client::decrypt_group_name(master_key, user_id, &wrapped_key, &nonce, blob_b64).ok()
 }
 
 fn fetch_groups_decrypted(
     client: &reqwest::blocking::Client,
     api_url: &str,
     jwt: &str,
-    enc_key: &[u8; 32],
+    master_key: &MasterKey,
     user_id: &str,
 ) -> Vec<(String, String, serde_json::Value)> {
     let resp = client
@@ -121,7 +69,7 @@ fn fetch_groups_decrypted(
     let mut result = Vec::new();
     for group in groups {
         let id = group["id"].as_str().unwrap_or("").to_string();
-        if let Some(name) = decrypt_group_name(&group, enc_key, user_id) {
+        if let Some(name) = decrypt_group_name_from_json(&group, master_key, user_id) {
             result.push((id, name, group));
         }
     }
@@ -132,7 +80,7 @@ fn resolve_group_id(
     client: &reqwest::blocking::Client,
     api_url: &str,
     jwt: &str,
-    enc_key: &[u8; 32],
+    master_key: &MasterKey,
     user_id: &str,
     name_or_id: &str,
 ) -> String {
@@ -141,7 +89,7 @@ fn resolve_group_id(
         return name_or_id.to_string();
     }
 
-    let groups = fetch_groups_decrypted(client, api_url, jwt, enc_key, user_id);
+    let groups = fetch_groups_decrypted(client, api_url, jwt, master_key, user_id);
     groups
         .iter()
         .find(|(_, name, _)| name == name_or_id)
@@ -162,13 +110,9 @@ fn run_create(client: &reqwest::blocking::Client, api_url: &str, name: &str) {
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
 
-    let (blob_b64, wrapped_key, nonce) = encrypt_group_blob(name, &enc_key, &user_id);
+    let (blob_b64, wrapped_key, nonce) = encrypt_group_blob(master_key, &user_id, name);
 
     let resp = client
         .post(format!("{}/groups", auth.api_url()))
@@ -205,13 +149,9 @@ fn run_list(client: &reqwest::blocking::Client, api_url: &str, json: bool) {
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
 
-    let groups = fetch_groups_decrypted(client, auth.api_url(), auth.jwt(), &enc_key, &user_id);
+    let groups = fetch_groups_decrypted(client, auth.api_url(), auth.jwt(), master_key, &user_id);
 
     if json {
         let out: Vec<_> = groups
@@ -244,16 +184,12 @@ fn run_show(client: &reqwest::blocking::Client, api_url: &str, group: &str, json
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
     let group_id = resolve_group_id(
         client,
         auth.api_url(),
         auth.jwt(),
-        &enc_key,
+        master_key,
         &user_id,
         group,
     );
@@ -280,21 +216,17 @@ fn run_rename(client: &reqwest::blocking::Client, api_url: &str, group: &str, ne
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
     let group_id = resolve_group_id(
         client,
         auth.api_url(),
         auth.jwt(),
-        &enc_key,
+        master_key,
         &user_id,
         group,
     );
 
-    let (blob_b64, wrapped_key, nonce) = encrypt_group_blob(new_name, &enc_key, &user_id);
+    let (blob_b64, wrapped_key, nonce) = encrypt_group_blob(master_key, &user_id, new_name);
 
     let resp = client
         .put(format!("{}/groups/{}", auth.api_url(), group_id))
@@ -329,16 +261,12 @@ fn run_delete(client: &reqwest::blocking::Client, api_url: &str, group: &str) {
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
     let group_id = resolve_group_id(
         client,
         auth.api_url(),
         auth.jwt(),
-        &enc_key,
+        master_key,
         &user_id,
         group,
     );
@@ -371,16 +299,12 @@ fn run_add(client: &reqwest::blocking::Client, api_url: &str, group: &str, label
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
     let group_id = resolve_group_id(
         client,
         auth.api_url(),
         auth.jwt(),
-        &enc_key,
+        master_key,
         &user_id,
         group,
     );
@@ -424,16 +348,12 @@ fn run_remove(client: &reqwest::blocking::Client, api_url: &str, group: &str, la
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
     let group_id = resolve_group_id(
         client,
         auth.api_url(),
         auth.jwt(),
-        &enc_key,
+        master_key,
         &user_id,
         group,
     );
@@ -481,16 +401,12 @@ fn run_items(client: &reqwest::blocking::Client, api_url: &str, group: &str, jso
         }
     };
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
     let group_id = resolve_group_id(
         client,
         auth.api_url(),
         auth.jwt(),
-        &enc_key,
+        master_key,
         &user_id,
         group,
     );

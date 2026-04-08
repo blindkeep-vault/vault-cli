@@ -83,11 +83,6 @@ pub fn run_grant_create(
         });
 
     // Decrypt item key
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-
     let item_resp = client
         .get(format!("{}/items/{}", effective_url, item_id))
         .header("Authorization", format!("Bearer {}", jwt))
@@ -105,19 +100,12 @@ pub fn run_grant_create(
     let nonce = json_to_bytes(&item["nonce"]);
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let wrap_aad = if user_id.is_empty() {
-        Vec::new()
-    } else {
-        format!("wrap:{}", user_id).into_bytes()
-    };
-    let item_key_plain =
-        vault_core::crypto::decrypt_item_auto(&enc_key, &wrapped_key, &nonce, &wrap_aad)
+    let item_key =
+        vault_core::client::unwrap_owned_item_key(master_key, &user_id, &wrapped_key, &nonce)
             .unwrap_or_else(|e| {
                 eprintln!("error decrypting item key: {}", e);
                 std::process::exit(1);
             });
-    let mut item_key = [0u8; 32];
-    item_key.copy_from_slice(&item_key_plain);
 
     // Fetch recipient's public key
     let pk_resp = client
@@ -150,11 +138,13 @@ pub fn run_grant_create(
     recipient_pubkey.copy_from_slice(&recipient_pubkey_bytes);
 
     // Wrap item key for recipient (V1 key-bound, grant format: nonce || ciphertext)
-    let (grant_wrapped_key, ephemeral_pubkey) = wrap_key_for_grant(&item_key, &recipient_pubkey)
-        .unwrap_or_else(|e| {
+    let grant =
+        vault_core::client::prepare_grant(&item_key, &recipient_pubkey).unwrap_or_else(|e| {
             eprintln!("error wrapping key: {}", e);
             std::process::exit(1);
         });
+    let grant_wrapped_key = grant.grant_wrapped_key;
+    let ephemeral_pubkey = grant.ephemeral_pubkey;
 
     // Build policy
     let allowed_ops = if read_only {
@@ -328,11 +318,6 @@ pub fn run_grant_access(
     eph_pub.copy_from_slice(&ephemeral_pubkey);
 
     // Decrypt user's private key
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-
     let me_resp = client
         .get(format!("{}/auth/me", effective_url))
         .header("Authorization", format!("Bearer {}", jwt))
@@ -349,10 +334,12 @@ pub fn run_grant_access(
     let encrypted_privkey = json_to_bytes(&me["encrypted_private_key"]);
     let my_pubkey_bytes = json_to_bytes(&me["public_key"]);
 
-    let private_key = decrypt_private_key(&enc_key, &encrypted_privkey).unwrap_or_else(|e| {
-        eprintln!("error decrypting private key: {}", e);
-        std::process::exit(1);
-    });
+    let private_key =
+        vault_core::client::decrypt_private_key_from_master(master_key, &encrypted_privkey)
+            .unwrap_or_else(|e| {
+                eprintln!("error decrypting private key: {}", e);
+                std::process::exit(1);
+            });
 
     if my_pubkey_bytes.len() != 32 {
         eprintln!("error: invalid public key on your account");
@@ -381,24 +368,12 @@ pub fn run_grant_access(
     }
 
     let grantor_id = body["grantor_id"].as_str().unwrap_or("");
-    let blob_aad = if grantor_id.is_empty() {
-        Vec::new()
-    } else {
-        format!("item:{}", grantor_id).into_bytes()
-    };
 
-    let plaintext = if blob_data[0] == 0x01 && blob_data.len() > 25 {
-        let nonce = &blob_data[1..25];
-        let ciphertext = &blob_data[25..];
-        vault_core::crypto::decrypt_item_auto(&item_key, ciphertext, nonce, &blob_aad)
-            .or_else(|_| decrypt_item(&item_key, &blob_data[24..], &blob_data[..24]))
-    } else {
-        decrypt_item(&item_key, &blob_data[24..], &blob_data[..24])
-    }
-    .unwrap_or_else(|e| {
-        eprintln!("error decrypting grant content: {}", e);
-        std::process::exit(1);
-    });
+    let plaintext = vault_core::envelope::decrypt_blob_bytes(&blob_data, &item_key, grantor_id)
+        .unwrap_or_else(|e| {
+            eprintln!("error decrypting grant content: {}", e);
+            std::process::exit(1);
+        });
 
     // Try to parse as SecretBlob (CLI-created items)
     if let Ok(blob) = serde_json::from_slice::<SecretBlob>(&plaintext) {
@@ -545,11 +520,6 @@ pub fn run_grant_create_link(
         });
 
     // Decrypt item key
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-
     let item_resp = client
         .get(format!("{}/items/{}", effective_url, item_id))
         .header("Authorization", format!("Bearer {}", jwt))
@@ -567,19 +537,12 @@ pub fn run_grant_create_link(
     let nonce = json_to_bytes(&item["nonce"]);
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let wrap_aad = if user_id.is_empty() {
-        Vec::new()
-    } else {
-        format!("wrap:{}", user_id).into_bytes()
-    };
-    let item_key_plain =
-        vault_core::crypto::decrypt_item_auto(&enc_key, &wrapped_key, &nonce, &wrap_aad)
+    let item_key =
+        vault_core::client::unwrap_owned_item_key(master_key, &user_id, &wrapped_key, &nonce)
             .unwrap_or_else(|e| {
                 eprintln!("error decrypting item key: {}", e);
                 std::process::exit(1);
             });
-    let mut item_key = [0u8; 32];
-    item_key.copy_from_slice(&item_key_plain);
 
     // Generate random link_secret
     let mut link_secret = [0u8; 32];
@@ -643,12 +606,17 @@ pub fn run_grant_create_link(
         let file_wk = json_to_bytes(&item["file_wrapped_key"]);
         let file_nonce = json_to_bytes(&item["file_nonce"]);
         if !file_wk.is_empty() && !file_nonce.is_empty() {
-            let file_key_plain =
-                vault_core::crypto::decrypt_item_auto(&enc_key, &file_wk, &file_nonce, &wrap_aad)
-                    .unwrap_or_else(|e| {
-                        eprintln!("error decrypting file key: {}", e);
-                        std::process::exit(1);
-                    });
+            let file_key = vault_core::client::unwrap_owned_item_key(
+                master_key,
+                &user_id,
+                &file_wk,
+                &file_nonce,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("error decrypting file key: {}", e);
+                std::process::exit(1);
+            });
+            let file_key_plain = vault_core::Zeroizing::new(file_key.to_vec());
             // Wrap file key with link_secret: nonce(24) + ciphertext
             let file_enc = encrypt_item(&link_secret, &file_key_plain).unwrap_or_else(|e| {
                 eprintln!("error wrapping file key: {}", e);
@@ -795,24 +763,12 @@ pub fn run_grant_access_link(
     }
 
     let grantor_id = grant["grantor_id"].as_str().unwrap_or("");
-    let blob_aad = if grantor_id.is_empty() {
-        Vec::new()
-    } else {
-        format!("item:{}", grantor_id).into_bytes()
-    };
 
-    let plaintext = if blob_data[0] == 0x01 && blob_data.len() > 25 {
-        let nonce = &blob_data[1..25];
-        let ciphertext = &blob_data[25..];
-        vault_core::crypto::decrypt_item_auto(&item_key, ciphertext, nonce, &blob_aad)
-            .or_else(|_| decrypt_item(&item_key, &blob_data[24..], &blob_data[..24]))
-    } else {
-        decrypt_item(&item_key, &blob_data[24..], &blob_data[..24])
-    }
-    .unwrap_or_else(|e| {
-        eprintln!("error decrypting grant content: {}", e);
-        std::process::exit(1);
-    });
+    let plaintext = vault_core::envelope::decrypt_blob_bytes(&blob_data, &item_key, grantor_id)
+        .unwrap_or_else(|e| {
+            eprintln!("error decrypting grant content: {}", e);
+            std::process::exit(1);
+        });
 
     // Output
     if let Ok(blob) = serde_json::from_slice::<SecretBlob>(&plaintext) {
@@ -891,11 +847,6 @@ pub fn run_grant_reshare(
     let grant_wrapped_key = json_to_bytes(&body["wrapped_key"]);
     let ephemeral_pubkey = json_to_bytes(&body["ephemeral_pubkey"]);
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-
     let me_resp = client
         .get(format!("{}/auth/me", effective_url))
         .header("Authorization", format!("Bearer {}", jwt))
@@ -912,10 +863,12 @@ pub fn run_grant_reshare(
     let encrypted_privkey = json_to_bytes(&me["encrypted_private_key"]);
     let my_pubkey_bytes = json_to_bytes(&me["public_key"]);
 
-    let private_key = decrypt_private_key(&enc_key, &encrypted_privkey).unwrap_or_else(|e| {
-        eprintln!("error decrypting private key: {}", e);
-        std::process::exit(1);
-    });
+    let private_key =
+        vault_core::client::decrypt_private_key_from_master(master_key, &encrypted_privkey)
+            .unwrap_or_else(|e| {
+                eprintln!("error decrypting private key: {}", e);
+                std::process::exit(1);
+            });
 
     if my_pubkey_bytes.len() != 32 || ephemeral_pubkey.len() != 32 {
         eprintln!("error: invalid key data on grant");
@@ -963,11 +916,13 @@ pub fn run_grant_reshare(
     recipient_pubkey.copy_from_slice(&recipient_pubkey_bytes);
 
     // Wrap item key for new recipient
-    let (new_wrapped_key, new_eph_pubkey) = wrap_key_for_grant(&item_key, &recipient_pubkey)
-        .unwrap_or_else(|e| {
+    let new_grant =
+        vault_core::client::prepare_grant(&item_key, &recipient_pubkey).unwrap_or_else(|e| {
             eprintln!("error wrapping key: {}", e);
             std::process::exit(1);
         });
+    let new_wrapped_key = new_grant.grant_wrapped_key;
+    let new_eph_pubkey = new_grant.ephemeral_pubkey;
 
     // Build policy
     let mut policy = serde_json::json!({

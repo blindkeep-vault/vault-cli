@@ -43,43 +43,41 @@ pub fn run_apikey_create(
         std::process::exit(1);
     });
 
-    // Generate random 32-byte API key secret
-    let mut secret = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut secret);
-
-    let (wrapping_key, auth_key) = derive_api_key_keys(&secret).unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-
-    let key_prefix = format!("vk_{}", hex::encode(&secret[..4]));
-
-    let (wrapped_master_key, encrypted_private_key, public_key): (
+    #[allow(clippy::type_complexity)]
+    let (secret, key_prefix, auth_key_hex, wrapped_master_key, encrypted_private_key, public_key): (
+        [u8; 32],
+        String,
+        String,
         Option<Vec<u8>>,
         Vec<u8>,
         Option<Vec<u8>>,
     ) = if scoped {
-        // Scoped key: generate X25519 keypair, wrap private key with API wrapping key
         eprintln!("Generating scoped API key...");
-        let (privkey, pubkey) = generate_x25519_keypair();
-        let wrapped_privkey = wrap_master_key(&wrapping_key, &MasterKey::from_bytes(privkey))
-            .unwrap_or_else(|e| {
-                eprintln!("error wrapping private key: {}", e);
-                std::process::exit(1);
-            });
-        (None, wrapped_privkey, Some(pubkey.to_vec()))
+        let prepared = vault_core::client::prepare_api_key_scoped().unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+        (
+            prepared.secret,
+            prepared.key_prefix,
+            prepared.auth_key_hex,
+            None,
+            prepared.encrypted_private_key,
+            Some(prepared.public_key.to_vec()),
+        )
     } else {
         // Full-access key: wrap user's master key
         let password = prompt_password("Password (to wrap master key): ");
         eprintln!("Deriving master key...");
-        let master_key = derive_master_key(password.as_bytes(), &session.client_salt)
+        let login = vault_core::client::prepare_login(&password, &session.client_salt)
             .unwrap_or_else(|e| {
                 eprintln!("error: key derivation failed: {}", e);
                 std::process::exit(1);
             });
+        let master_key = unwrap_master_key_from_profile(client, &session, &login.master_key);
 
         eprintln!("Wrapping master key...");
-        let wmk = wrap_master_key(&wrapping_key, &master_key).unwrap_or_else(|e| {
+        let prepared = vault_core::client::prepare_api_key_full(&master_key).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(1);
         });
@@ -100,7 +98,14 @@ pub fn run_apikey_create(
         let me: serde_json::Value = me_resp.json().expect("invalid JSON");
         let epk = json_to_bytes(&me["encrypted_private_key"]);
 
-        (Some(wmk), epk, None)
+        (
+            prepared.secret,
+            prepared.key_prefix,
+            prepared.auth_key_hex,
+            Some(prepared.wrapped_master_key),
+            epk,
+            None,
+        )
     };
 
     let expires_at = expires.map(|e| {
@@ -111,7 +116,7 @@ pub fn run_apikey_create(
 
     let mut body = serde_json::json!({
         "name": name,
-        "auth_key": hex::encode(auth_key),
+        "auth_key": auth_key_hex,
         "key_prefix": key_prefix,
         "encrypted_private_key": encrypted_private_key,
         "scopes": {"read_only": read_only},
@@ -257,8 +262,8 @@ pub fn run_apikey_grant(
     });
 
     let password = prompt_password("Password: ");
-    let master_key =
-        derive_master_key(password.as_bytes(), &session.client_salt).unwrap_or_else(|e| {
+    let login =
+        vault_core::client::prepare_login(&password, &session.client_salt).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(1);
         });
@@ -295,7 +300,7 @@ pub fn run_apikey_grant(
     // Find the item by label
     let auth = AuthContext::Full {
         jwt: session.jwt.clone(),
-        master_key,
+        master_key: login.master_key,
         api_url: api_url.to_string(),
     };
     let secrets = fetch_and_decrypt_secrets(client, &auth);
@@ -307,17 +312,12 @@ pub fn run_apikey_grant(
             std::process::exit(1);
         });
 
-    // Unwrap the item key using master key
+    // Fetch the item to get wrapped_key and nonce, then unwrap + re-wrap for API key
     let mk = match &auth {
         AuthContext::Full { master_key, .. } => master_key,
         _ => unreachable!(),
     };
-    let enc_key = derive_subkey(mk, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-
-    // Fetch the item to get wrapped_key and nonce
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
     let item_resp = client
         .get(format!("{}/items/{}", api_url, item_id))
         .header("Authorization", format!("Bearer {}", session.jwt))
@@ -334,18 +334,12 @@ pub fn run_apikey_grant(
     let wrapped_key = json_to_bytes(&item["wrapped_key"]);
     let nonce = json_to_bytes(&item["nonce"]);
 
-    let item_key_plain = decrypt_item(&enc_key, &wrapped_key, &nonce).unwrap_or_else(|e| {
-        eprintln!("error decrypting item key: {}", e);
-        std::process::exit(1);
-    });
-    let mut item_key = [0u8; 32];
-    item_key.copy_from_slice(&item_key_plain);
-
-    // Wrap item key for the API key's public key
-    let grant_wrap = wrap_key_for_recipient(&item_key, &api_pubkey).unwrap_or_else(|e| {
-        eprintln!("error wrapping key: {}", e);
-        std::process::exit(1);
-    });
+    let grant_wrap =
+        vault_core::client::grant_item_to_api_key(mk, &user_id, &wrapped_key, &nonce, &api_pubkey)
+            .unwrap_or_else(|e| {
+                eprintln!("error wrapping key: {}", e);
+                std::process::exit(1);
+            });
 
     // POST the grant
     let resp = client
@@ -423,15 +417,15 @@ pub fn run_apikey_ungrant(
     });
 
     let password = prompt_password("Password: ");
-    let master_key =
-        derive_master_key(password.as_bytes(), &session.client_salt).unwrap_or_else(|e| {
+    let login =
+        vault_core::client::prepare_login(&password, &session.client_salt).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(1);
         });
 
     let auth = AuthContext::Full {
         jwt: session.jwt.clone(),
-        master_key,
+        master_key: login.master_key,
         api_url: api_url.to_string(),
     };
     let secrets = fetch_and_decrypt_secrets(client, &auth);
@@ -557,13 +551,13 @@ pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_
     } else {
         let password = prompt_password("Password (to wrap master key): ");
         eprintln!("Deriving master key...");
-        let master_key = derive_master_key(password.as_bytes(), &session.client_salt)
+        let login = vault_core::client::prepare_login(&password, &session.client_salt)
             .unwrap_or_else(|e| {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             });
 
-        let wmk = wrap_master_key(&wrapping_key, &master_key).unwrap_or_else(|e| {
+        let wmk = wrap_master_key(&wrapping_key, &login.master_key).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(1);
         });
@@ -641,15 +635,12 @@ pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_
         } else {
             unreachable!()
         };
-        let master_key = derive_master_key(password.as_bytes(), &session.client_salt)
+        let login = vault_core::client::prepare_login(&password, &session.client_salt)
             .unwrap_or_else(|e| {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             });
-        let enc_key = derive_subkey(&master_key, b"vault-enc").unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+        let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
 
         let grants_resp = client
             .get(format!("{}/api-keys/{}/grants", api_url, old_id))
@@ -680,22 +671,20 @@ pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_
                 let wrapped_key = json_to_bytes(&item["wrapped_key"]);
                 let nonce = json_to_bytes(&item["nonce"]);
 
-                let item_key_plain = match decrypt_item(&enc_key, &wrapped_key, &nonce) {
-                    Ok(k) => k,
+                // Unwrap item key and wrap for new API key's public key
+                let grant_wrap = match vault_core::client::grant_item_to_api_key(
+                    &login.master_key,
+                    &user_id,
+                    &wrapped_key,
+                    &nonce,
+                    &new_pubkey,
+                ) {
+                    Ok(g) => g,
                     Err(e) => {
-                        eprintln!("warning: could not decrypt item key for {}: {}", item_id, e);
+                        eprintln!("warning: could not re-wrap item key for {}: {}", item_id, e);
                         continue;
                     }
                 };
-                let mut item_key = [0u8; 32];
-                item_key.copy_from_slice(&item_key_plain);
-
-                // Wrap for new API key's public key
-                let grant_wrap =
-                    wrap_key_for_recipient(&item_key, &new_pubkey).unwrap_or_else(|e| {
-                        eprintln!("error wrapping key for grant: {}", e);
-                        std::process::exit(1);
-                    });
 
                 let resp = client
                     .post(format!("{}/api-keys/{}/grants", api_url, new_id))

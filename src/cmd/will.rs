@@ -32,16 +32,7 @@ fn build_will_payload(
     grace_days: u32,
     items_filter: Option<&str>,
 ) -> serde_json::Value {
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let wrap_aad = if user_id.is_empty() {
-        Vec::new()
-    } else {
-        format!("wrap:{}", user_id).into_bytes()
-    };
 
     // Fetch all items
     let items_resp = client
@@ -72,20 +63,15 @@ fn build_will_payload(
             continue;
         }
 
-        let item_key_plain = match vault_core::crypto::decrypt_item_auto(
-            &enc_key,
+        let item_key = match vault_core::client::unwrap_owned_item_key(
+            master_key,
+            &user_id,
             &wrapped_key,
             &nonce,
-            &wrap_aad,
         ) {
             Ok(k) => k,
             Err(_) => continue,
         };
-        if item_key_plain.len() != 32 {
-            continue;
-        }
-        let mut item_key = [0u8; 32];
-        item_key.copy_from_slice(&item_key_plain);
 
         if let Some(ref labels) = filter_labels {
             // Decrypt blob to get name, check if it matches filter
@@ -163,11 +149,13 @@ fn build_will_payload(
         heir_pubkey.copy_from_slice(&heir_pubkey_bytes);
 
         // Wrap will_key for heir using X25519
-        let (encrypted_will_key, ephemeral_pubkey) = wrap_key_for_grant(&will_key, &heir_pubkey)
-            .unwrap_or_else(|e| {
+        let will_grant =
+            vault_core::client::prepare_grant(&will_key, &heir_pubkey).unwrap_or_else(|e| {
                 eprintln!("error wrapping will key: {}", e);
                 std::process::exit(1);
             });
+        let encrypted_will_key = will_grant.grant_wrapped_key;
+        let ephemeral_pubkey = will_grant.ephemeral_pubkey;
 
         serde_json::json!({
             "heir_email": heir_email,

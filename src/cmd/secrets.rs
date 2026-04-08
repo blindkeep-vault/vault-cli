@@ -27,42 +27,6 @@ pub fn run_put(
         }
     };
 
-    let blob = SecretBlob {
-        name: label.to_string(),
-        content: Some(secret_value),
-        label: None,
-        item_type: None,
-        value: None,
-        filename: None,
-        mime_type: None,
-        file_size: None,
-        file_wrapped_key: None,
-        file_nonce: None,
-    };
-    let blob_json = serde_json::to_vec(&blob).expect("serialize blob");
-
-    // Generate random item key
-    let mut item_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut item_key);
-
-    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-
-    // Encrypt blob with item key (V1 with AAD)
-    let blob_aad = format!("item:{}", user_id);
-    let enc_blob = vault_core::crypto::encrypt_item_v1(&item_key, &blob_json, blob_aad.as_bytes())
-        .unwrap_or_else(|e| {
-            eprintln!("error encrypting: {}", e);
-            std::process::exit(1);
-        });
-
-    // Build blob: 0x01 + nonce(24) + ciphertext (V1 concat format)
-    let mut blob_data = Vec::with_capacity(1 + 24 + enc_blob.ciphertext.len());
-    blob_data.push(0x01);
-    blob_data.extend_from_slice(&enc_blob.nonce);
-    blob_data.extend_from_slice(&enc_blob.ciphertext);
-    let blob_b64 = STANDARD.encode(&blob_data);
-
-    // Wrap item key with encryption subkey (V1 with AAD)
     let master_key = match &auth {
         AuthContext::Full { master_key, .. } => master_key,
         AuthContext::Scoped { .. } => {
@@ -70,24 +34,22 @@ pub fn run_put(
             std::process::exit(1);
         }
     };
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-    let wrap_aad = format!("wrap:{}", user_id);
-    let wrapped = vault_core::crypto::encrypt_item_v1(&enc_key, &item_key, wrap_aad.as_bytes())
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let prepared =
+        vault_core::client::prepare_item_create(master_key, &user_id, label, &secret_value, None)
+            .unwrap_or_else(|e| {
+                eprintln!("error encrypting: {}", e);
+                std::process::exit(1);
+            });
 
     let resp = client
         .post(format!("{}/items", auth.api_url()))
         .header("Authorization", format!("Bearer {}", auth.jwt()))
         .json(&serde_json::json!({
-            "encrypted_blob": blob_b64,
-            "wrapped_key": wrapped.ciphertext,
-            "nonce": wrapped.nonce.to_vec(),
+            "encrypted_blob": prepared.encrypted_blob_b64,
+            "wrapped_key": prepared.wrapped_key,
+            "nonce": prepared.nonce.to_vec(),
             "item_type": "encrypted",
         }))
         .send()

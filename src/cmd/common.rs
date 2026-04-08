@@ -366,17 +366,6 @@ pub fn fetch_secrets_full(
 
     let items: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
 
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error deriving encryption key: {}", e);
-        std::process::exit(1);
-    });
-
-    let wrap_aad = if user_id.is_empty() {
-        Vec::new()
-    } else {
-        format!("wrap:{}", user_id).into_bytes()
-    };
-
     let mut secrets = Vec::new();
     let mut skipped_decrypt = 0usize;
     for item in &items {
@@ -387,11 +376,11 @@ pub fn fetch_secrets_full(
             continue;
         }
 
-        let item_key_plain = match vault_core::crypto::decrypt_item_auto(
-            &enc_key,
+        let item_key = match vault_core::client::unwrap_owned_item_key(
+            master_key,
+            user_id,
             &wrapped_key,
             &nonce,
-            &wrap_aad,
         ) {
             Ok(k) => k,
             Err(_) => {
@@ -399,12 +388,6 @@ pub fn fetch_secrets_full(
                 continue;
             }
         };
-        if item_key_plain.len() != 32 {
-            skipped_decrypt += 1;
-            continue;
-        }
-        let mut item_key = [0u8; 32];
-        item_key.copy_from_slice(&item_key_plain);
 
         // For file items, the envelope is inline in encrypted_blob (file data is at file_blob_key).
         // For regular items, fetch blob from /items/:id/blob.

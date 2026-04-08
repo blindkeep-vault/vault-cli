@@ -118,33 +118,6 @@ pub fn run_env_push(client: &reqwest::blocking::Client, api_url: &str, label: &s
     }
 
     // Create the envfile item
-    let blob = SecretBlob {
-        name: label.to_string(),
-        content: Some(content),
-        label: None,
-        item_type: Some("envfile".to_string()),
-        value: None,
-        filename: None,
-        mime_type: None,
-        file_size: None,
-        file_wrapped_key: None,
-        file_nonce: None,
-    };
-    let blob_json = serde_json::to_vec(&blob).expect("serialize blob");
-
-    let mut item_key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut item_key);
-
-    let enc_blob = encrypt_item(&item_key, &blob_json).unwrap_or_else(|e| {
-        eprintln!("error encrypting: {}", e);
-        std::process::exit(1);
-    });
-
-    let mut blob_data = Vec::with_capacity(24 + enc_blob.ciphertext.len());
-    blob_data.extend_from_slice(&enc_blob.nonce);
-    blob_data.extend_from_slice(&enc_blob.ciphertext);
-    let blob_b64 = STANDARD.encode(&blob_data);
-
     let master_key = match &auth {
         AuthContext::Full { master_key, .. } => master_key,
         AuthContext::Scoped { .. } => {
@@ -152,12 +125,17 @@ pub fn run_env_push(client: &reqwest::blocking::Client, api_url: &str, label: &s
             std::process::exit(1);
         }
     };
-    let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
-        std::process::exit(1);
-    });
-    let wrapped = encrypt_item(&enc_key, &item_key).unwrap_or_else(|e| {
-        eprintln!("error: {}", e);
+
+    let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let prepared = vault_core::client::prepare_item_create(
+        master_key,
+        &user_id,
+        label,
+        &content,
+        Some("envfile"),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("error encrypting: {}", e);
         std::process::exit(1);
     });
 
@@ -165,9 +143,9 @@ pub fn run_env_push(client: &reqwest::blocking::Client, api_url: &str, label: &s
         .post(format!("{}/items", auth.api_url()))
         .header("Authorization", format!("Bearer {}", auth.jwt()))
         .json(&serde_json::json!({
-            "encrypted_blob": blob_b64,
-            "wrapped_key": wrapped.ciphertext,
-            "nonce": wrapped.nonce.to_vec(),
+            "encrypted_blob": prepared.encrypted_blob_b64,
+            "wrapped_key": prepared.wrapped_key,
+            "nonce": prepared.nonce.to_vec(),
             "item_type": "encrypted",
         }))
         .send()
