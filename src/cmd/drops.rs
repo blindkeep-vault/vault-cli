@@ -46,13 +46,11 @@ pub fn run_drop_download(
                 std::process::exit(1);
             }
 
-            let wrapped = drop_meta["wrapped_drop_key"]
-                .as_array()
-                .expect("drop has no wrapped_drop_key (not a mnemonic drop)");
-            let wrapped_bytes: Vec<u8> = wrapped
-                .iter()
-                .map(|v: &serde_json::Value| v.as_u64().unwrap() as u8)
-                .collect();
+            let wrapped_bytes = json_to_bytes(&drop_meta["wrapped_drop_key"]);
+            if wrapped_bytes.is_empty() {
+                eprintln!("error: drop has no wrapped_drop_key (not a mnemonic drop)");
+                std::process::exit(1);
+            }
 
             let version = drop_meta["drop_key_version"].as_i64().unwrap_or(1) as i32;
             eprintln!("Deriving wrapping key (v{})...", version);
@@ -297,13 +295,11 @@ pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, k
                 std::process::exit(1);
             }
 
-            let wrapped = drop_meta["wrapped_drop_key"]
-                .as_array()
-                .expect("drop has no wrapped_drop_key (not a mnemonic drop)");
-            let wrapped_bytes: Vec<u8> = wrapped
-                .iter()
-                .map(|v: &serde_json::Value| v.as_u64().unwrap() as u8)
-                .collect();
+            let wrapped_bytes = json_to_bytes(&drop_meta["wrapped_drop_key"]);
+            if wrapped_bytes.is_empty() {
+                eprintln!("error: drop has no wrapped_drop_key (not a mnemonic drop)");
+                std::process::exit(1);
+            }
 
             let version = drop_meta["drop_key_version"].as_i64().unwrap_or(1) as i32;
             eprintln!("Deriving wrapping key (v{})...", version);

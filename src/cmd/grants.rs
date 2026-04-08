@@ -129,13 +129,10 @@ pub fn run_grant_create(
         std::process::exit(1);
     }
     let pk_body: serde_json::Value = pk_resp.json().expect("invalid JSON");
-    let recipient_pubkey_bytes = json_to_bytes(&pk_body["public_key"]);
-    if recipient_pubkey_bytes.len() != 32 {
+    let recipient_pubkey = json_to_array32(&pk_body["public_key"]).unwrap_or_else(|| {
         eprintln!("error: recipient has invalid public key");
         std::process::exit(1);
-    }
-    let mut recipient_pubkey = [0u8; 32];
-    recipient_pubkey.copy_from_slice(&recipient_pubkey_bytes);
+    });
 
     // Wrap item key for recipient (V1 key-bound, grant format: nonce || ciphertext)
     let grant =
@@ -160,7 +157,10 @@ pub fn run_grant_create(
         policy["max_views"] = serde_json::json!(n);
     }
     if let Some(exp) = expires {
-        let duration = parse_duration(exp);
+        let duration = parse_duration(exp).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
         let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
         policy["expires_at"] = serde_json::json!(expires_at);
     }
@@ -309,13 +309,10 @@ pub fn run_grant_access(
 
     // Extract grant key material
     let grant_wrapped_key = json_to_bytes(&body["wrapped_key"]);
-    let ephemeral_pubkey = json_to_bytes(&body["ephemeral_pubkey"]);
-    if ephemeral_pubkey.len() != 32 {
+    let eph_pub = json_to_array32(&body["ephemeral_pubkey"]).unwrap_or_else(|| {
         eprintln!("error: invalid grant data (bad ephemeral pubkey)");
         std::process::exit(1);
-    }
-    let mut eph_pub = [0u8; 32];
-    eph_pub.copy_from_slice(&ephemeral_pubkey);
+    });
 
     // Decrypt user's private key
     let me_resp = client
@@ -332,7 +329,6 @@ pub fn run_grant_access(
     }
     let me: serde_json::Value = me_resp.json().expect("invalid JSON");
     let encrypted_privkey = json_to_bytes(&me["encrypted_private_key"]);
-    let my_pubkey_bytes = json_to_bytes(&me["public_key"]);
 
     let private_key =
         vault_core::client::decrypt_private_key_from_master(master_key, &encrypted_privkey)
@@ -341,12 +337,10 @@ pub fn run_grant_access(
                 std::process::exit(1);
             });
 
-    if my_pubkey_bytes.len() != 32 {
+    let my_pubkey = json_to_array32(&me["public_key"]).unwrap_or_else(|| {
         eprintln!("error: invalid public key on your account");
         std::process::exit(1);
-    }
-    let mut my_pubkey = [0u8; 32];
-    my_pubkey.copy_from_slice(&my_pubkey_bytes);
+    });
 
     // Unwrap item key (auto-detects V0/V1)
     let item_key = unwrap_grant_key(&private_key, &eph_pub, &grant_wrapped_key, &my_pubkey)
@@ -427,47 +421,18 @@ pub fn run_grant_revoke(client: &reqwest::blocking::Client, api_url: &str, grant
     eprintln!("Grant {} revoked.", grant_id);
 }
 
-/// Encrypt link_secret with claimKey using AES-256-GCM (compatible with Web UI's SubtleCrypto)
 fn encrypt_claim_secret(claim_key: &[u8; 32], link_secret: &[u8; 32]) -> Vec<u8> {
-    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
-    let cipher = Aes256Gcm::new(claim_key.into());
-    let mut iv = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut iv);
-    let nonce = Nonce::from_slice(&iv);
-    let ciphertext = cipher
-        .encrypt(nonce, link_secret.as_ref())
-        .unwrap_or_else(|e| {
-            eprintln!("error encrypting claim secret: {}", e);
-            std::process::exit(1);
-        });
-    let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&iv);
-    result.extend_from_slice(&ciphertext);
-    result
+    vault_core::crypto::encrypt_claim_secret(claim_key, link_secret).unwrap_or_else(|e| {
+        eprintln!("error encrypting claim secret: {}", e);
+        std::process::exit(1);
+    })
 }
 
-/// Decrypt link_secret from claim_ciphertext using AES-256-GCM
 fn decrypt_claim_secret(claim_key: &[u8; 32], claim_ciphertext: &[u8]) -> [u8; 32] {
-    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
-    if claim_ciphertext.len() < 12 {
-        eprintln!("error: claim_ciphertext too short");
-        std::process::exit(1);
-    }
-    let iv = &claim_ciphertext[..12];
-    let ct = &claim_ciphertext[12..];
-    let cipher = Aes256Gcm::new(claim_key.into());
-    let nonce = Nonce::from_slice(iv);
-    let plaintext = cipher.decrypt(nonce, ct).unwrap_or_else(|e| {
+    vault_core::crypto::decrypt_claim_secret(claim_key, claim_ciphertext).unwrap_or_else(|e| {
         eprintln!("error decrypting claim secret: {}", e);
         std::process::exit(1);
-    });
-    if plaintext.len() != 32 {
-        eprintln!("error: decrypted link_secret has wrong length");
-        std::process::exit(1);
-    }
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&plaintext);
-    result
+    })
 }
 
 /// Parse a grant-accept URL: /#/grant-accept/{id}/{secret} or full URL
@@ -579,7 +544,10 @@ pub fn run_grant_create_link(
         policy["max_views"] = serde_json::json!(n);
     }
     if let Some(exp) = expires {
-        let duration = parse_duration(exp);
+        let duration = parse_duration(exp).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
         let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
         policy["expires_at"] = serde_json::json!(expires_at);
     }
@@ -845,7 +813,10 @@ pub fn run_grant_reshare(
 
     // Decrypt item key from grant
     let grant_wrapped_key = json_to_bytes(&body["wrapped_key"]);
-    let ephemeral_pubkey = json_to_bytes(&body["ephemeral_pubkey"]);
+    let eph_pub = json_to_array32(&body["ephemeral_pubkey"]).unwrap_or_else(|| {
+        eprintln!("error: invalid key data on grant");
+        std::process::exit(1);
+    });
 
     let me_resp = client
         .get(format!("{}/auth/me", effective_url))
@@ -861,7 +832,6 @@ pub fn run_grant_reshare(
     }
     let me: serde_json::Value = me_resp.json().expect("invalid JSON");
     let encrypted_privkey = json_to_bytes(&me["encrypted_private_key"]);
-    let my_pubkey_bytes = json_to_bytes(&me["public_key"]);
 
     let private_key =
         vault_core::client::decrypt_private_key_from_master(master_key, &encrypted_privkey)
@@ -870,14 +840,10 @@ pub fn run_grant_reshare(
                 std::process::exit(1);
             });
 
-    if my_pubkey_bytes.len() != 32 || ephemeral_pubkey.len() != 32 {
+    let my_pubkey = json_to_array32(&me["public_key"]).unwrap_or_else(|| {
         eprintln!("error: invalid key data on grant");
         std::process::exit(1);
-    }
-    let mut eph_pub = [0u8; 32];
-    eph_pub.copy_from_slice(&ephemeral_pubkey);
-    let mut my_pubkey = [0u8; 32];
-    my_pubkey.copy_from_slice(&my_pubkey_bytes);
+    });
 
     let item_key = unwrap_grant_key(&private_key, &eph_pub, &grant_wrapped_key, &my_pubkey)
         .unwrap_or_else(|e| {
@@ -907,13 +873,10 @@ pub fn run_grant_reshare(
         std::process::exit(1);
     }
     let pk_body: serde_json::Value = pk_resp.json().expect("invalid JSON");
-    let recipient_pubkey_bytes = json_to_bytes(&pk_body["public_key"]);
-    if recipient_pubkey_bytes.len() != 32 {
+    let recipient_pubkey = json_to_array32(&pk_body["public_key"]).unwrap_or_else(|| {
         eprintln!("error: recipient has invalid public key");
         std::process::exit(1);
-    }
-    let mut recipient_pubkey = [0u8; 32];
-    recipient_pubkey.copy_from_slice(&recipient_pubkey_bytes);
+    });
 
     // Wrap item key for new recipient
     let new_grant =
@@ -933,7 +896,10 @@ pub fn run_grant_reshare(
         policy["max_views"] = serde_json::json!(n);
     }
     if let Some(exp) = expires {
-        let duration = parse_duration(exp);
+        let duration = parse_duration(exp).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
         let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
         policy["expires_at"] = serde_json::json!(expires_at);
     }

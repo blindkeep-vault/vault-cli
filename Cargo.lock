@@ -2395,7 +2395,6 @@ dependencies = [
 name = "vault-cli"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "axum",
  "base64",
  "bip39",
@@ -2428,6 +2427,7 @@ dependencies = [
 name = "vault-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "argon2",
  "base64",
  "bip39",

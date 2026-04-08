@@ -191,13 +191,6 @@ pub fn parse_api_key(raw_key: &str) -> (String, vault_core::Zeroizing<[u8; 32]>)
     })
 }
 
-pub fn json_to_bytes(val: &serde_json::Value) -> Vec<u8> {
-    match val.as_array() {
-        Some(a) => a.iter().map(|v| v.as_u64().unwrap_or(0) as u8).collect(),
-        None => Vec::new(),
-    }
-}
-
 pub fn auth_with_api_key(
     client: &reqwest::blocking::Client,
     api_url: &str,
@@ -267,25 +260,6 @@ pub fn auth_with_api_key(
             master_key,
             api_url: api_url.to_string(),
         }
-    }
-}
-
-// --- Login / Logout ---
-
-pub fn parse_duration(s: &str) -> chrono::Duration {
-    let s = s.trim();
-    if let Some(hours) = s.strip_suffix('h') {
-        chrono::Duration::hours(hours.parse().expect("invalid number of hours"))
-    } else if let Some(days) = s.strip_suffix('d') {
-        chrono::Duration::days(days.parse().expect("invalid number of days"))
-    } else if let Some(years) = s.strip_suffix('y') {
-        chrono::Duration::days(years.parse::<i64>().expect("invalid number of years") * 365)
-    } else {
-        eprintln!(
-            "error: invalid expiry format '{}' (use e.g. '24h', '7d', or '1y')",
-            s
-        );
-        std::process::exit(1);
     }
 }
 
@@ -452,14 +426,12 @@ pub fn fetch_secrets_scoped(
     for grant in &grants {
         let item_id = grant["item_id"].as_str().unwrap_or("").to_string();
         let wrapped_key = json_to_bytes(&grant["wrapped_key"]);
-        let ephemeral_pubkey = json_to_bytes(&grant["ephemeral_pubkey"]);
         let nonce = json_to_bytes(&grant["nonce"]);
 
-        if wrapped_key.is_empty() || ephemeral_pubkey.len() != 32 {
-            continue;
-        }
-        let mut eph_pub = [0u8; 32];
-        eph_pub.copy_from_slice(&ephemeral_pubkey);
+        let eph_pub = match json_to_array32(&grant["ephemeral_pubkey"]) {
+            Some(ep) if !wrapped_key.is_empty() => ep,
+            _ => continue,
+        };
 
         // Unwrap item key using API key's private key via X25519 DH
         let item_key = match unwrap_key(api_privkey, &eph_pub, &wrapped_key, &nonce) {

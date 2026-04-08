@@ -110,7 +110,10 @@ pub fn run_apikey_create(
 
     let expires_at = expires.map(|e| {
         let now = chrono::Utc::now();
-        let duration = parse_duration(e);
+        let duration = parse_duration(e).unwrap_or_else(|err| {
+            eprintln!("error: {}", err);
+            std::process::exit(1);
+        });
         (now + duration).to_rfc3339()
     });
 
@@ -289,13 +292,10 @@ pub fn run_apikey_grant(
             eprintln!("error: API key '{}' not found", key_id);
             std::process::exit(1);
         });
-    let api_pubkey_bytes = json_to_bytes(&api_key["public_key"]);
-    if api_pubkey_bytes.len() != 32 {
+    let api_pubkey = json_to_array32(&api_key["public_key"]).unwrap_or_else(|| {
         eprintln!("error: API key '{}' is not a scoped key", key_id);
         std::process::exit(1);
-    }
-    let mut api_pubkey = [0u8; 32];
-    api_pubkey.copy_from_slice(&api_pubkey_bytes);
+    });
 
     // Find the item by label
     let auth = AuthContext::Full {
@@ -622,9 +622,10 @@ pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_
 
     // Re-grant items if scoped
     if is_scoped {
-        let new_pubkey_bytes = json_to_bytes(&new_key_resp["public_key"]);
-        let mut new_pubkey = [0u8; 32];
-        new_pubkey.copy_from_slice(&new_pubkey_bytes);
+        let new_pubkey = json_to_array32(&new_key_resp["public_key"]).unwrap_or_else(|| {
+            eprintln!("error: new API key has invalid public key");
+            std::process::exit(1);
+        });
 
         // Get old key's private key to unwrap grants
         // We need the old API key's private key. The user doesn't have the old secret anymore

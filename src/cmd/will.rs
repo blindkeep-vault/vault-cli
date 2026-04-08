@@ -140,13 +140,10 @@ fn build_will_payload(
 
     if heir_has_account {
         let pk_body: serde_json::Value = pk_resp.unwrap().json().expect("invalid JSON");
-        let heir_pubkey_bytes = json_to_bytes(&pk_body["public_key"]);
-        if heir_pubkey_bytes.len() != 32 {
+        let heir_pubkey = json_to_array32(&pk_body["public_key"]).unwrap_or_else(|| {
             eprintln!("error: heir has invalid public key");
             std::process::exit(1);
-        }
-        let mut heir_pubkey = [0u8; 32];
-        heir_pubkey.copy_from_slice(&heir_pubkey_bytes);
+        });
 
         // Wrap will_key for heir using X25519
         let will_grant =
