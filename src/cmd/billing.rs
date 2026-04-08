@@ -1,27 +1,13 @@
 use super::*;
 
-pub fn run_billing_balance(client: &reqwest::blocking::Client, api_url: &str, json: bool) {
+pub fn run_billing_balance(_client: &reqwest::blocking::Client, api_url: &str, json: bool) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .get(format!("{}/billing/balance", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let body: serde_json::Value = resp.json().expect("invalid JSON");
+    let vc = VaultClient::new(api_url, &session.jwt);
+    let body: serde_json::Value = vc.get("/billing/balance").json().expect("invalid JSON");
 
     if json {
         println!(
@@ -47,28 +33,14 @@ pub fn run_billing_balance(client: &reqwest::blocking::Client, api_url: &str, js
     }
 }
 
-pub fn run_billing_history(client: &reqwest::blocking::Client, api_url: &str, json: bool) {
+pub fn run_billing_history(_client: &reqwest::blocking::Client, api_url: &str, json: bool) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .get(format!("{}/billing/history", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let entries: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let vc = VaultClient::new(api_url, &session.jwt);
+    let entries: Vec<serde_json::Value> = vc.get("/billing/history").json().expect("invalid JSON");
 
     if json {
         println!(

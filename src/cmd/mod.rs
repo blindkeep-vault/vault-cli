@@ -9,6 +9,7 @@ pub mod env;
 pub mod files;
 pub mod grants;
 pub mod groups;
+pub mod http;
 pub mod inbox;
 pub mod notarize;
 pub mod secrets;
@@ -36,3 +37,5 @@ pub use vault_core::drops::{
 pub use vault_core::envelope::{decrypt_inline_envelope, parse_envelope, SecretBlob};
 pub use vault_core::padding::{pad_plaintext, unpad};
 pub use vault_core::util::{json_to_array32, json_to_bytes, parse_duration};
+
+pub use http::VaultClient;

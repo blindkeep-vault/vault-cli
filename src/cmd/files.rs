@@ -51,17 +51,15 @@ pub fn run_file_put(
     let envelope_b64 = prepared.envelope_b64.clone();
     let file_blob_len = file_blob.len();
 
+    let vc = VaultClient::from_auth(&auth);
+
     // Get presigned upload URL
     eprintln!("Uploading ({} bytes)...", file_blob_len);
-    let url_resp: serde_json::Value = client
-        .post(format!("{}/items/upload-url", auth.api_url()))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .json(&serde_json::json!({ "size_bytes": file_blob_len }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: failed to get upload URL: {}", e);
-            std::process::exit(1);
-        })
+    let url_resp: serde_json::Value = vc
+        .post_json(
+            "/items/upload-url",
+            &serde_json::json!({ "size_bytes": file_blob_len }),
+        )
         .json()
         .unwrap_or_else(|e| {
             eprintln!("error: invalid upload-url response: {}", e);
@@ -79,7 +77,7 @@ pub fn run_file_put(
 
     // Upload file blob to S3 (with API proxy fallback)
     let proxy_upload = url_resp["proxy_upload"].as_bool().unwrap_or(false);
-    let upload_result = client.put(upload_url).body(file_blob.clone()).send();
+    let upload_result = vc.inner().put(upload_url).body(file_blob.clone()).send();
     let needs_fallback = match &upload_result {
         Err(_) => true,
         Ok(resp) => !resp.status().is_success() && proxy_upload,
@@ -87,19 +85,7 @@ pub fn run_file_put(
 
     if needs_fallback && proxy_upload {
         eprintln!("Direct upload failed, falling back to API proxy...");
-        let proxy_resp = client
-            .put(format!("{}/items/upload/{}", auth.api_url(), s3_key))
-            .header("Authorization", format!("Bearer {}", auth.jwt()))
-            .body(file_blob)
-            .send()
-            .unwrap_or_else(|e| {
-                eprintln!("error: proxy upload failed: {}", e);
-                std::process::exit(1);
-            });
-        if !proxy_resp.status().is_success() {
-            eprintln!("error: proxy upload failed ({})", proxy_resp.status());
-            std::process::exit(1);
-        }
+        vc.put_bytes(&format!("/items/upload/{}", s3_key), file_blob);
     } else {
         let put_resp = upload_result.unwrap_or_else(|e| {
             eprintln!("error: upload failed: {}", e);
@@ -112,28 +98,17 @@ pub fn run_file_put(
     }
 
     // Create item with envelope inline + file blob reference
-    let resp = client
-        .post(format!("{}/items", auth.api_url()))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .json(&serde_json::json!({
+    vc.post_json(
+        "/items",
+        &serde_json::json!({
             "encrypted_blob": envelope_b64,
             "wrapped_key": prepared.wrapped_key,
             "nonce": prepared.nonce.to_vec(),
             "item_type": "encrypted",
             "file_blob_key": s3_key,
             "size_bytes": file_blob_len,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
+        }),
+    );
 
     eprintln!("File '{}' stored as '{}'.", file_name, label);
 }
@@ -147,7 +122,7 @@ pub fn run_file_get(
     let auth = get_auth(client, api_url);
 
     // Find the file item by listing and decrypting envelopes
-    let (jwt, master_key, user_id) = match &auth {
+    let (_jwt, master_key, user_id) = match &auth {
         AuthContext::Full {
             jwt, master_key, ..
         } => {
@@ -160,22 +135,8 @@ pub fn run_file_get(
         }
     };
 
-    let resp = client
-        .get(format!("{}/items", auth.api_url()))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let items: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let vc = VaultClient::from_auth(&auth);
+    let items: Vec<serde_json::Value> = vc.get("/items").json().expect("invalid JSON");
 
     // Find matching file item and keep its item_key
     let mut found: Option<(String, SecretBlob, [u8; 32])> = None;
@@ -248,21 +209,7 @@ pub fn run_file_get(
 
     // Download the encrypted file blob
     eprintln!("Downloading...");
-    let blob_resp = client
-        .get(format!("{}/items/{}/blob", auth.api_url(), item_id))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !blob_resp.status().is_success() {
-        let text = blob_resp.text().unwrap_or_default();
-        eprintln!("error downloading file: {}", text);
-        std::process::exit(1);
-    }
-
+    let blob_resp = vc.get(&format!("/items/{}/blob", item_id));
     let raw = blob_resp.bytes().unwrap_or_default().to_vec();
 
     // Try base64 decode (S3 may return base64-encoded data)

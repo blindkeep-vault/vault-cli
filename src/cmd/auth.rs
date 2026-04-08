@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn run_register(client: &reqwest::blocking::Client, api_url: &str) {
+pub fn run_register(_client: &reqwest::blocking::Client, api_url: &str) {
     let email = prompt_line("Email: ");
     let password = prompt_password("Password: ");
     let password2 = prompt_password("Confirm password: ");
@@ -21,29 +21,23 @@ pub fn run_register(client: &reqwest::blocking::Client, api_url: &str) {
         std::process::exit(1);
     });
 
+    let vc = VaultClient::new(api_url, "");
+
     eprintln!("Registering...");
-    let resp = client
-        .post(format!("{}/auth/register", api_url))
-        .json(&serde_json::json!({
-            "email": email,
-            "auth_key": reg.auth_key_hex,
-            "public_key": reg.public_key.to_vec(),
-            "encrypted_private_key": reg.encrypted_private_key,
-            "client_salt": reg.client_salt,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let auth: serde_json::Value = vc
+        .post_json_unauth(
+            "/auth/register",
+            &serde_json::json!({
+                "email": email,
+                "auth_key": reg.auth_key_hex,
+                "public_key": reg.public_key.to_vec(),
+                "encrypted_private_key": reg.encrypted_private_key,
+                "client_salt": reg.client_salt,
+            }),
+        )
+        .json()
+        .expect("invalid JSON");
 
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: registration failed: {}", text);
-        std::process::exit(1);
-    }
-
-    let auth: serde_json::Value = resp.json().expect("invalid JSON");
     let jwt = auth["token"].as_str().expect("missing token").to_string();
     let user_id = auth["user_id"]
         .as_str()
@@ -64,15 +58,11 @@ pub fn run_register(client: &reqwest::blocking::Client, api_url: &str) {
 pub fn run_login(client: &reqwest::blocking::Client, api_url: &str) {
     let email = prompt_line("Email: ");
 
+    let vc = VaultClient::new(api_url, "");
+
     // Get client_salt
-    let params_resp = client
-        .post(format!("{}/auth/client-params", api_url))
-        .json(&serde_json::json!({"email": email}))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let params_resp =
+        vc.post_json_unauth_raw("/auth/client-params", &serde_json::json!({"email": email}));
 
     if !params_resp.status().is_success() {
         eprintln!("error: failed to get client params");
@@ -96,17 +86,13 @@ pub fn run_login(client: &reqwest::blocking::Client, api_url: &str) {
             std::process::exit(1);
         });
 
-    let login_resp = client
-        .post(format!("{}/auth/login", api_url))
-        .json(&serde_json::json!({
+    let login_resp = vc.post_json_unauth_raw(
+        "/auth/login",
+        &serde_json::json!({
             "email": email,
             "auth_key": login_payload.auth_key_hex,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+        }),
+    );
 
     if !login_resp.status().is_success() {
         let text = login_resp.text().unwrap_or_default();
@@ -180,15 +166,10 @@ pub fn run_change_password(client: &reqwest::blocking::Client, _api_url: &str) {
 
     let master_key = unwrap_master_key_from_profile(client, &session, &current_login.master_key);
 
+    let vc = VaultClient::new(&session.api_url, &session.jwt);
+
     // Fetch profile to get encrypted_private_key and public_key
-    let me_resp = client
-        .get(format!("{}/auth/me", session.api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let me_resp = vc.get_raw("/auth/me");
     if !me_resp.status().is_success() {
         eprintln!("error: session expired, please login again");
         std::process::exit(1);
@@ -213,22 +194,17 @@ pub fn run_change_password(client: &reqwest::blocking::Client, _api_url: &str) {
 
     // Send to server
     eprintln!("Updating password...");
-    let resp = client
-        .post(format!("{}/auth/set-password", session.api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .json(&serde_json::json!({
+    let resp = vc.post_json_raw(
+        "/auth/set-password",
+        &serde_json::json!({
             "auth_key": change.new_auth_key_hex,
             "public_key": public_key,
             "encrypted_private_key": change.new_encrypted_private_key,
             "client_salt": change.new_client_salt,
             "current_auth_key": change.current_auth_key_hex,
             "encrypted_master_key": change.new_encrypted_master_key,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+        }),
+    );
 
     if !resp.status().is_success() {
         let text = resp.text().unwrap_or_default();

@@ -7,7 +7,7 @@ pub fn run_will(client: &reqwest::blocking::Client, api_url: &str, action: crate
             grace_days,
             items,
         } => run_create(client, api_url, &heir, grace_days, items.as_deref()),
-        crate::WillAction::Show => run_show(client, api_url),
+        crate::WillAction::Show => run_show(api_url),
         crate::WillAction::Update {
             heir,
             grace_days,
@@ -19,7 +19,7 @@ pub fn run_will(client: &reqwest::blocking::Client, api_url: &str, action: crate
             grace_days,
             items.as_deref(),
         ),
-        crate::WillAction::Delete => run_delete(client, api_url),
+        crate::WillAction::Delete => run_delete(api_url),
     }
 }
 
@@ -33,22 +33,10 @@ fn build_will_payload(
     items_filter: Option<&str>,
 ) -> serde_json::Value {
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
+    let vc = VaultClient::new(api_url, jwt);
 
     // Fetch all items
-    let items_resp = client
-        .get(format!("{}/items", api_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !items_resp.status().is_success() {
-        let text = items_resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-    let all_items: Vec<serde_json::Value> = items_resp.json().expect("invalid JSON");
+    let all_items: Vec<serde_json::Value> = vc.get("/items").json().expect("invalid JSON");
 
     // Filter items if specified
     let filter_labels: Option<Vec<&str>> = items_filter.map(|f| f.split(',').collect());
@@ -126,20 +114,12 @@ fn build_will_payload(
         );
     }
 
-    // Try to fetch heir's public key
-    let pk_resp = client
-        .get(format!("{}/users/public-key", api_url))
-        .query(&[("email", heir_email)])
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send();
-
-    let heir_has_account = pk_resp
-        .as_ref()
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // Try to fetch heir's public key (may 404 if heir has no account)
+    let pk_resp = vc.get_query_raw("/users/public-key", &[("email", heir_email)]);
+    let heir_has_account = pk_resp.status().is_success();
 
     if heir_has_account {
-        let pk_body: serde_json::Value = pk_resp.unwrap().json().expect("invalid JSON");
+        let pk_body: serde_json::Value = pk_resp.json().expect("invalid JSON");
         let heir_pubkey = json_to_array32(&pk_body["public_key"]).unwrap_or_else(|| {
             eprintln!("error: heir has invalid public key");
             std::process::exit(1);
@@ -234,41 +214,22 @@ fn run_create(
         items,
     );
 
-    let resp = client
-        .post(format!("{}/will", effective_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .json(&payload)
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
+    let vc = VaultClient::new(effective_url, jwt);
+    vc.post_json("/will", &payload);
 
     eprintln!("Will created successfully.");
     eprintln!("Heir: {}", heir);
     eprintln!("Grace period: {} days", grace_days);
 }
 
-fn run_show(client: &reqwest::blocking::Client, api_url: &str) {
+fn run_show(api_url: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .get(format!("{}/will", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let vc = VaultClient::new(api_url, &session.jwt);
+    let resp = vc.get_raw("/will");
 
     if !resp.status().is_success() {
         if resp.status().as_u16() == 404 {
@@ -330,15 +291,10 @@ fn run_update(
         }
     };
 
+    let vc = VaultClient::new(effective_url, jwt);
+
     // Fetch existing will to get defaults
-    let existing_resp = client
-        .get(format!("{}/will", effective_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let existing_resp = vc.get_raw("/will");
     if !existing_resp.status().is_success() {
         eprintln!("error: no existing will to update");
         std::process::exit(1);
@@ -357,45 +313,17 @@ fn run_update(
         items,
     );
 
-    let resp = client
-        .put(format!("{}/will", effective_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .json(&payload)
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
+    vc.put_json("/will", &payload);
     eprintln!("Will updated successfully.");
 }
 
-fn run_delete(client: &reqwest::blocking::Client, api_url: &str) {
+fn run_delete(api_url: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .delete(format!("{}/will", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
+    let vc = VaultClient::new(api_url, &session.jwt);
+    vc.delete("/will");
     eprintln!("Will deleted.");
 }

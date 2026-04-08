@@ -43,26 +43,16 @@ pub fn run_put(
                 std::process::exit(1);
             });
 
-    let resp = client
-        .post(format!("{}/items", auth.api_url()))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .json(&serde_json::json!({
+    let vc = VaultClient::from_auth(&auth);
+    vc.post_json(
+        "/items",
+        &serde_json::json!({
             "encrypted_blob": prepared.encrypted_blob_b64,
             "wrapped_key": prepared.wrapped_key,
             "nonce": prepared.nonce.to_vec(),
             "item_type": "encrypted",
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
+        }),
+    );
 
     eprintln!("Secret '{}' stored.", label);
 }
@@ -158,21 +148,8 @@ pub fn run_rm(client: &reqwest::blocking::Client, api_url: &str, label: &str) {
         .find(|(_, blob, _)| blob.display_name() == label);
     match found {
         Some((item_id, _, _)) => {
-            let resp = client
-                .delete(format!("{}/items/{}", auth.api_url(), item_id))
-                .header("Authorization", format!("Bearer {}", auth.jwt()))
-                .send()
-                .unwrap_or_else(|e| {
-                    eprintln!("error: {}", e);
-                    std::process::exit(1);
-                });
-
-            if !resp.status().is_success() {
-                let text = resp.text().unwrap_or_default();
-                eprintln!("error: {}", text);
-                std::process::exit(1);
-            }
-
+            let vc = VaultClient::from_auth(&auth);
+            vc.delete(&format!("/items/{}", item_id));
             eprintln!("Secret '{}' deleted.", label);
         }
         None => {

@@ -1,7 +1,7 @@
 use super::*;
 
 pub fn run_drop_download(
-    client: &reqwest::blocking::Client,
+    _client: &reqwest::blocking::Client,
     api_url: &str,
     key: &str,
     key2: Option<&str>,
@@ -11,16 +11,17 @@ pub fn run_drop_download(
 
     match parsed {
         crate::ParsedInput::Direct { drop_id, key } => {
-            download_drop(client, api_url, &drop_id, &key, output);
+            download_drop(api_url, &drop_id, &key, output);
         }
         crate::ParsedInput::Mnemonic { mnemonic, drop_id } => {
+            let vc = VaultClient::new(api_url, "");
+
             let resolved_id = match drop_id {
                 Some(id) => id,
                 None => {
                     eprintln!("Looking up drop by mnemonic...");
                     let lookup_key = derive_drop_lookup_key(&mnemonic);
-                    let url = format!("{}/drops/by-words/{}", api_url, lookup_key);
-                    let resp = client.get(&url).send().expect("request failed");
+                    let resp = vc.get_unauth_raw(&format!("/drops/by-words/{}", lookup_key));
                     if !resp.status().is_success() {
                         eprintln!("error: drop not found (expired or wrong words)");
                         std::process::exit(1);
@@ -34,8 +35,7 @@ pub fn run_drop_download(
                 }
             };
 
-            let url = format!("{}/drops/{}", api_url, resolved_id);
-            let resp = client.get(&url).send().expect("request failed");
+            let resp = vc.get_unauth_raw(&format!("/drops/{}", resolved_id));
             if !resp.status().is_success() {
                 eprintln!("error: drop not found");
                 std::process::exit(1);
@@ -60,7 +60,7 @@ pub fn run_drop_download(
                 std::process::exit(1);
             });
 
-            download_drop(client, api_url, &resolved_id, &drop_key, output);
+            download_drop(api_url, &resolved_id, &drop_key, output);
         }
     }
 }
@@ -214,20 +214,10 @@ pub fn extract_pickup_uuid(s: &str) -> Option<String> {
     }
 }
 
-pub fn download_drop(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    drop_id: &str,
-    key: &[u8; 32],
-    output: Option<PathBuf>,
-) {
+pub fn download_drop(api_url: &str, drop_id: &str, key: &[u8; 32], output: Option<PathBuf>) {
     eprintln!("Downloading drop {}...", drop_id);
-    let url = format!("{}/drops/{}/blob", api_url, drop_id);
-    let resp = client.get(&url).send().expect("request failed");
-    if !resp.status().is_success() {
-        eprintln!("error: failed to download blob ({})", resp.status());
-        std::process::exit(1);
-    }
+    let vc = VaultClient::new(api_url, "");
+    let resp = vc.get_unauth(&format!("/drops/{}/blob", drop_id));
     let encrypted = resp.bytes().expect("failed to read body");
     let encrypted = encrypted.as_ref();
 
@@ -258,6 +248,7 @@ pub fn download_drop(
 
 pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, key2: Option<&str>) {
     let parsed = parse_input(key, key2);
+    let vc = VaultClient::new(api_url, "");
 
     // Resolve the drop key (32 bytes) and drop ID
     let (drop_id, drop_key) = match parsed {
@@ -268,8 +259,7 @@ pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, k
                 None => {
                     eprintln!("Looking up drop by mnemonic...");
                     let lookup_key = derive_drop_lookup_key(&mnemonic);
-                    let url = format!("{}/drops/by-words/{}", api_url, lookup_key);
-                    let resp = client.get(&url).send().expect("request failed");
+                    let resp = vc.get_unauth_raw(&format!("/drops/by-words/{}", lookup_key));
                     if !resp.status().is_success() {
                         eprintln!("error: drop not found (expired or wrong words)");
                         std::process::exit(1);
@@ -283,8 +273,7 @@ pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, k
                 }
             };
 
-            let url = format!("{}/drops/{}", api_url, resolved_id);
-            let resp = client.get(&url).send().expect("request failed");
+            let resp = vc.get_unauth_raw(&format!("/drops/{}", resolved_id));
             if !resp.status().is_success() {
                 eprintln!("error: drop not found");
                 std::process::exit(1);
@@ -335,32 +324,23 @@ pub fn run_claim(client: &reqwest::blocking::Client, api_url: &str, key: &str, k
         });
 
     // POST /drops/:id/claim
-    let resp = client
-        .post(format!("{}/drops/{}/claim", auth.api_url(), drop_id))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .json(&serde_json::json!({
-            "wrapped_key": wrapped.wrapped_key,
-            "nonce": wrapped.nonce.to_vec(),
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let body: serde_json::Value = resp.json().unwrap_or_default();
+    let auth_vc = VaultClient::from_auth(&auth);
+    let body: serde_json::Value = auth_vc
+        .post_json(
+            &format!("/drops/{}/claim", drop_id),
+            &serde_json::json!({
+                "wrapped_key": wrapped.wrapped_key,
+                "nonce": wrapped.nonce.to_vec(),
+            }),
+        )
+        .json()
+        .unwrap_or_default();
     let item_id = body["id"].as_str().unwrap_or("?");
     eprintln!("Drop claimed! New item ID: {}", item_id);
 }
 
 pub fn run_drop_upload(
-    client: &reqwest::blocking::Client,
+    _client: &reqwest::blocking::Client,
     api_url: &str,
     file_path: &std::path::Path,
 ) {
@@ -424,16 +404,15 @@ pub fn run_drop_upload(
         std::process::exit(1);
     });
 
+    let vc = VaultClient::new(api_url, "");
+
     // Get presigned upload URL
     eprintln!("Uploading ({} bytes)...", blob.len());
-    let url_resp: serde_json::Value = client
-        .post(format!("{}/drops/upload-url", api_url))
-        .json(&serde_json::json!({ "size_bytes": blob.len() }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: failed to get upload URL: {}", e);
-            std::process::exit(1);
-        })
+    let url_resp: serde_json::Value = vc
+        .post_json_unauth(
+            "/drops/upload-url",
+            &serde_json::json!({ "size_bytes": blob.len() }),
+        )
         .json()
         .unwrap_or_else(|e| {
             eprintln!("error: invalid upload-url response: {}", e);
@@ -451,7 +430,7 @@ pub fn run_drop_upload(
 
     // Upload blob to S3 (with API proxy fallback)
     let proxy_upload = url_resp["proxy_upload"].as_bool().unwrap_or(false);
-    let upload_result = client.put(upload_url).body(blob.clone()).send();
+    let upload_result = vc.inner().put(upload_url).body(blob.clone()).send();
     let needs_fallback = match &upload_result {
         Err(_) => true,
         Ok(resp) => !resp.status().is_success() && proxy_upload,
@@ -459,7 +438,8 @@ pub fn run_drop_upload(
 
     if needs_fallback && proxy_upload {
         eprintln!("Direct upload failed, falling back to API proxy...");
-        let proxy_resp = client
+        let proxy_resp = vc
+            .inner()
             .put(format!("{}/drops/upload/{}", api_url, s3_key))
             .body(blob.clone())
             .send()
@@ -486,21 +466,18 @@ pub fn run_drop_upload(
     let nonce_array: Vec<u8> = enc.nonce.to_vec();
     let wrapped_array: Vec<u8> = wrapped_drop_key;
 
-    let drop_resp: serde_json::Value = client
-        .post(format!("{}/drops", api_url))
-        .json(&serde_json::json!({
-            "s3_key": s3_key,
-            "size_bytes": blob.len(),
-            "nonce": nonce_array,
-            "wrapped_drop_key": wrapped_array,
-            "lookup_key": lookup_key,
-            "drop_key_version": 2,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: failed to create drop: {}", e);
-            std::process::exit(1);
-        })
+    let drop_resp: serde_json::Value = vc
+        .post_json_unauth(
+            "/drops",
+            &serde_json::json!({
+                "s3_key": s3_key,
+                "size_bytes": blob.len(),
+                "nonce": nonce_array,
+                "wrapped_drop_key": wrapped_array,
+                "lookup_key": lookup_key,
+                "drop_key_version": 2,
+            }),
+        )
         .json()
         .unwrap_or_else(|e| {
             eprintln!("error: invalid drop response: {}", e);

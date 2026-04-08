@@ -1,7 +1,7 @@
 use super::*;
 
 pub fn run_audit(
-    client: &reqwest::blocking::Client,
+    _client: &reqwest::blocking::Client,
     api_url: &str,
     resource_type: Option<&str>,
     limit: Option<i64>,
@@ -12,6 +12,8 @@ pub fn run_audit(
         std::process::exit(1);
     });
 
+    let vc = VaultClient::new(api_url, &session.jwt);
+
     let mut params = Vec::new();
     if let Some(rt) = resource_type {
         params.push(("resource_type", rt.to_string()));
@@ -20,23 +22,10 @@ pub fn run_audit(
         params.push(("limit", n.to_string()));
     }
 
-    let resp = client
-        .get(format!("{}/audit-log", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .query(&params)
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let entries: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let entries: Vec<serde_json::Value> = vc
+        .get_query("/audit-log", &params)
+        .json()
+        .expect("invalid JSON");
 
     if json {
         println!(

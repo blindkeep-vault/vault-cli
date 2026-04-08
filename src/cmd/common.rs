@@ -152,18 +152,12 @@ pub fn get_auth(client: &reqwest::blocking::Client, api_url: &str) -> AuthContex
 }
 
 pub fn unwrap_master_key_from_profile(
-    client: &reqwest::blocking::Client,
+    _client: &reqwest::blocking::Client,
     session: &Session,
     password_key: &MasterKey,
 ) -> MasterKey {
-    let me_resp = client
-        .get(format!("{}/auth/me", session.api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error fetching profile: {}", e);
-            std::process::exit(1);
-        });
+    let vc = super::http::VaultClient::new(&session.api_url, &session.jwt);
+    let me_resp = vc.get_raw("/auth/me");
 
     if !me_resp.status().is_success() {
         eprintln!("error: session expired, please login again");
@@ -192,7 +186,7 @@ pub fn parse_api_key(raw_key: &str) -> (String, vault_core::Zeroizing<[u8; 32]>)
 }
 
 pub fn auth_with_api_key(
-    client: &reqwest::blocking::Client,
+    _client: &reqwest::blocking::Client,
     api_url: &str,
     raw_key: &str,
 ) -> AuthContext {
@@ -203,17 +197,14 @@ pub fn auth_with_api_key(
         std::process::exit(1);
     });
 
-    let resp = client
-        .post(format!("{}/auth/api-key", api_url))
-        .json(&serde_json::json!({
+    let vc = super::http::VaultClient::new(api_url, "");
+    let resp = vc.post_json_unauth_raw(
+        "/auth/api-key",
+        &serde_json::json!({
             "key_prefix": prefix,
             "auth_key": hex::encode(auth_key),
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: API key auth request failed: {}", e);
-            std::process::exit(1);
-        });
+        }),
+    );
 
     if !resp.status().is_success() {
         let text = resp.text().unwrap_or_default();
@@ -266,21 +257,20 @@ pub fn auth_with_api_key(
 // --- Secret CRUD ---
 
 pub fn decrypt_item_blob(
-    client: &reqwest::blocking::Client,
+    _client: &reqwest::blocking::Client,
     api_url: &str,
     jwt: &str,
     item_id: &str,
     item_key: &[u8; 32],
     user_id: &str,
 ) -> Option<SecretBlob> {
-    let blob_resp = client
-        .get(format!("{}/items/{}/blob", api_url, item_id))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send();
+    let vc = super::http::VaultClient::new(api_url, jwt);
+    let blob_resp = vc.get_raw(&format!("/items/{}/blob", item_id));
 
-    let raw = match blob_resp {
-        Ok(r) if r.status().is_success() => r.bytes().unwrap_or_default().to_vec(),
-        _ => return None,
+    let raw = if blob_resp.status().is_success() {
+        blob_resp.bytes().unwrap_or_default().to_vec()
+    } else {
+        return None;
     };
 
     // S3 stores the base64-encoded blob; decode it to get the encrypted payload
@@ -323,22 +313,8 @@ pub fn fetch_secrets_full(
     master_key: &MasterKey,
     user_id: &str,
 ) -> Vec<(String, SecretBlob, String)> {
-    let resp = client
-        .get(format!("{}/items", api_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let items: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let vc = super::http::VaultClient::new(api_url, jwt);
+    let items: Vec<serde_json::Value> = vc.get("/items").json().expect("invalid JSON");
 
     let mut secrets = Vec::new();
     let mut skipped_decrypt = 0usize;
@@ -405,22 +381,11 @@ pub fn fetch_secrets_scoped(
     api_key_id: &str,
 ) -> Vec<(String, SecretBlob, String)> {
     // Fetch grants for this API key
-    let resp = client
-        .get(format!("{}/api-keys/{}/grants", api_url, api_key_id))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let grants: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let vc = super::http::VaultClient::new(api_url, jwt);
+    let grants: Vec<serde_json::Value> = vc
+        .get(&format!("/api-keys/{}/grants", api_key_id))
+        .json()
+        .expect("invalid JSON");
 
     let mut secrets = Vec::new();
     for grant in &grants {

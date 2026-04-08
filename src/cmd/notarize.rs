@@ -3,7 +3,7 @@ use super::*;
 // --- Existing commands ---
 
 pub fn run_notarize(
-    client: &reqwest::blocking::Client,
+    _client: &reqwest::blocking::Client,
     api_url: &str,
     token: &str,
     input: &str,
@@ -35,33 +35,17 @@ pub fn run_notarize(
         body["item_id"] = serde_json::Value::String(id.to_string());
     }
 
-    let resp = client
-        .post(format!("{}/notarizations", api_url))
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .expect("request failed");
+    let vc = VaultClient::new(api_url, token);
+    let result: serde_json::Value = vc
+        .post_json("/notarizations", &body)
+        .json()
+        .expect("invalid JSON");
 
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: notarization failed: {}", text);
-        std::process::exit(1);
-    }
-
-    let result: serde_json::Value = resp.json().expect("invalid JSON");
     let notarization_id = result["id"].as_str().unwrap();
     eprintln!("Notarization created: {}", notarization_id);
 
     // Fetch certificate
-    let cert_resp = client
-        .get(format!(
-            "{}/notarizations/{}/certificate",
-            api_url, notarization_id
-        ))
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .expect("certificate request failed");
+    let cert_resp = vc.get_raw(&format!("/notarizations/{}/certificate", notarization_id));
 
     if !cert_resp.status().is_success() {
         eprintln!("warning: could not fetch certificate");
@@ -167,20 +151,10 @@ pub fn run_verify(certificate_path: &std::path::Path, document: Option<&std::pat
     }
 }
 
-pub fn run_list_notarizations(client: &reqwest::blocking::Client, api_url: &str, token: &str) {
-    let resp = client
-        .get(format!("{}/notarizations", api_url))
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .expect("request failed");
+pub fn run_list_notarizations(_client: &reqwest::blocking::Client, api_url: &str, token: &str) {
+    let vc = VaultClient::new(api_url, token);
+    let rows: Vec<serde_json::Value> = vc.get("/notarizations").json().expect("invalid JSON");
 
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let rows: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
     if rows.is_empty() {
         eprintln!("No notarizations found.");
         return;

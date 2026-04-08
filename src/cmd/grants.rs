@@ -17,12 +17,10 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
             expires.as_deref(),
             read_only,
         ),
-        crate::GrantAction::List { sent, received } => {
-            run_grant_list(client, api_url, sent, received)
-        }
+        crate::GrantAction::List { sent, received } => run_grant_list(api_url, sent, received),
         crate::GrantAction::Access { id, output } => run_grant_access(client, api_url, &id, output),
-        crate::GrantAction::Revoke { id } => run_grant_revoke(client, api_url, &id),
-        crate::GrantAction::Resend { id } => run_grant_resend(client, api_url, &id),
+        crate::GrantAction::Revoke { id } => run_grant_revoke(api_url, &id),
+        crate::GrantAction::Resend { id } => run_grant_resend(api_url, &id),
         crate::GrantAction::CreateLink {
             label,
             to,
@@ -39,7 +37,7 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
             read_only,
         ),
         crate::GrantAction::AccessLink { url, key, output } => {
-            run_grant_access_link(client, api_url, &url, key.as_deref(), output)
+            run_grant_access_link(api_url, &url, key.as_deref(), output)
         }
         crate::GrantAction::Reshare {
             id,
@@ -72,6 +70,8 @@ pub fn run_grant_create(
         }
     };
 
+    let vc = VaultClient::new(effective_url, jwt);
+
     // Find the item by label
     let secrets = fetch_and_decrypt_secrets(client, &auth);
     let (item_id, _, _) = secrets
@@ -83,19 +83,10 @@ pub fn run_grant_create(
         });
 
     // Decrypt item key
-    let item_resp = client
-        .get(format!("{}/items/{}", effective_url, item_id))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !item_resp.status().is_success() {
-        eprintln!("error: failed to fetch item");
-        std::process::exit(1);
-    }
-    let item: serde_json::Value = item_resp.json().expect("invalid JSON");
+    let item: serde_json::Value = vc
+        .get(&format!("/items/{}", item_id))
+        .json()
+        .expect("invalid JSON");
     let wrapped_key = json_to_bytes(&item["wrapped_key"]);
     let nonce = json_to_bytes(&item["nonce"]);
 
@@ -108,15 +99,7 @@ pub fn run_grant_create(
             });
 
     // Fetch recipient's public key
-    let pk_resp = client
-        .get(format!("{}/users/public-key", effective_url))
-        .query(&[("email", to_email)])
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let pk_resp = vc.get_query_raw("/users/public-key", &[("email", to_email)]);
     if !pk_resp.status().is_success() {
         if pk_resp.status().as_u16() == 404 {
             eprintln!(
@@ -166,61 +149,32 @@ pub fn run_grant_create(
     }
 
     // POST /grants
-    let resp = client
-        .post(format!("{}/grants", effective_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .json(&serde_json::json!({
-            "item_id": item_id,
-            "grantee_email": to_email,
-            "wrapped_key": grant_wrapped_key,
-            "ephemeral_pubkey": ephemeral_pubkey.to_vec(),
-            "policy": policy,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let body: serde_json::Value = resp.json().unwrap_or_default();
+    let body: serde_json::Value = vc
+        .post_json(
+            "/grants",
+            &serde_json::json!({
+                "item_id": item_id,
+                "grantee_email": to_email,
+                "wrapped_key": grant_wrapped_key,
+                "ephemeral_pubkey": ephemeral_pubkey.to_vec(),
+                "policy": policy,
+            }),
+        )
+        .json()
+        .unwrap_or_default();
     let grant_id = body["id"].as_str().unwrap_or("(unknown)");
     eprintln!("Grant created: {} -> {}", label, to_email);
     eprintln!("Grant ID: {}", grant_id);
 }
 
-pub fn run_grant_list(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    sent_only: bool,
-    received_only: bool,
-) {
+pub fn run_grant_list(api_url: &str, sent_only: bool, received_only: bool) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .get(format!("{}/grants", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let grants: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let vc = VaultClient::new(api_url, &session.jwt);
+    let grants: Vec<serde_json::Value> = vc.get("/grants").json().expect("invalid JSON");
 
     let filtered: Vec<_> = grants
         .iter()
@@ -283,16 +237,13 @@ pub fn run_grant_access(
         }
     };
 
+    let vc = VaultClient::new(effective_url, jwt);
+
     // Access the grant
-    let resp = client
-        .post(format!("{}/grants/{}/access", effective_url, grant_id))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .json(&serde_json::json!({"operation": "view"}))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let resp = vc.post_json_raw(
+        &format!("/grants/{}/access", grant_id),
+        &serde_json::json!({"operation": "view"}),
+    );
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -315,19 +266,7 @@ pub fn run_grant_access(
     });
 
     // Decrypt user's private key
-    let me_resp = client
-        .get(format!("{}/auth/me", effective_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !me_resp.status().is_success() {
-        eprintln!("error: failed to fetch profile");
-        std::process::exit(1);
-    }
-    let me: serde_json::Value = me_resp.json().expect("invalid JSON");
+    let me: serde_json::Value = vc.get("/auth/me").json().expect("invalid JSON");
     let encrypted_privkey = json_to_bytes(&me["encrypted_private_key"]);
 
     let private_key =
@@ -397,27 +336,14 @@ pub fn run_grant_access(
     }
 }
 
-pub fn run_grant_revoke(client: &reqwest::blocking::Client, api_url: &str, grant_id: &str) {
+pub fn run_grant_revoke(api_url: &str, grant_id: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .delete(format!("{}/grants/{}", api_url, grant_id))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
+    let vc = VaultClient::new(api_url, &session.jwt);
+    vc.delete(&format!("/grants/{}", grant_id));
     eprintln!("Grant {} revoked.", grant_id);
 }
 
@@ -474,6 +400,8 @@ pub fn run_grant_create_link(
         }
     };
 
+    let vc = VaultClient::new(effective_url, jwt);
+
     // Find the item by label
     let secrets = fetch_and_decrypt_secrets(client, &auth);
     let (item_id, _, _) = secrets
@@ -485,19 +413,10 @@ pub fn run_grant_create_link(
         });
 
     // Decrypt item key
-    let item_resp = client
-        .get(format!("{}/items/{}", effective_url, item_id))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !item_resp.status().is_success() {
-        eprintln!("error: failed to fetch item");
-        std::process::exit(1);
-    }
-    let item: serde_json::Value = item_resp.json().expect("invalid JSON");
+    let item: serde_json::Value = vc
+        .get(&format!("/items/{}", item_id))
+        .json()
+        .expect("invalid JSON");
     let wrapped_key = json_to_bytes(&item["wrapped_key"]);
     let nonce = json_to_bytes(&item["nonce"]);
 
@@ -597,39 +516,25 @@ pub fn run_grant_create_link(
         }
     }
 
-    let resp = client
-        .post(format!("{}/grants", effective_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .json(&grant_body)
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let body: serde_json::Value = resp.json().unwrap_or_default();
+    let body: serde_json::Value = vc
+        .post_json("/grants", &grant_body)
+        .json()
+        .unwrap_or_default();
     let grant_id = body["id"].as_str().unwrap_or("?");
 
     // Build share URL
     let claim_key_b64 = URL_SAFE_NO_PAD.encode(claim_key);
     let base_url = effective_url
-        .replace("/api.", "/app.")
-        .replace("api.blindkeep.com", "app.blindkeep.com");
+        .replace("://api.", "://app.")
+        .replace("://localhost:3000", "://localhost:8080");
     let share_url = format!("{}/#/grant-accept/{}/{}", base_url, grant_id, claim_key_b64);
 
     // Optionally send the link via email
     if to_email.is_some() {
-        let _ = client
-            .post(format!("{}/grants/{}/send-link", effective_url, grant_id))
-            .header("Authorization", format!("Bearer {}", jwt))
-            .json(&serde_json::json!({ "share_url": share_url }))
-            .send();
+        let _ = vc.post_json_raw(
+            &format!("/grants/{}/send-link", grant_id),
+            &serde_json::json!({ "share_url": share_url }),
+        );
     }
 
     eprintln!("Link-secret grant created.");
@@ -640,7 +545,6 @@ pub fn run_grant_create_link(
 }
 
 pub fn run_grant_access_link(
-    client: &reqwest::blocking::Client,
     api_url: &str,
     url: &str,
     key_arg: Option<&str>,
@@ -676,16 +580,13 @@ pub fn run_grant_access_link(
     hasher.update(claim_key);
     let token_hash = hex::encode(hasher.finalize());
 
+    let vc = VaultClient::new(api_url, "");
+
     // Try claim-token endpoint (works unauthenticated or authenticated)
-    // First try public preview
-    let preview_resp = client
-        .post(format!("{}/grants/{}/preview", api_url, grant_id))
-        .json(&serde_json::json!({ "token_hash": token_hash }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let preview_resp = vc.post_json_unauth_raw(
+        &format!("/grants/{}/preview", grant_id),
+        &serde_json::json!({ "token_hash": token_hash }),
+    );
 
     if !preview_resp.status().is_success() {
         let text = preview_resp.text().unwrap_or_default();
@@ -792,16 +693,13 @@ pub fn run_grant_reshare(
         }
     };
 
+    let vc = VaultClient::new(effective_url, jwt);
+
     // Access the grant to get the item key
-    let resp = client
-        .post(format!("{}/grants/{}/access", effective_url, grant_id))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .json(&serde_json::json!({"operation": "view"}))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let resp = vc.post_json_raw(
+        &format!("/grants/{}/access", grant_id),
+        &serde_json::json!({"operation": "view"}),
+    );
 
     if !resp.status().is_success() {
         let text = resp.text().unwrap_or_default();
@@ -818,19 +716,7 @@ pub fn run_grant_reshare(
         std::process::exit(1);
     });
 
-    let me_resp = client
-        .get(format!("{}/auth/me", effective_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !me_resp.status().is_success() {
-        eprintln!("error: failed to fetch profile");
-        std::process::exit(1);
-    }
-    let me: serde_json::Value = me_resp.json().expect("invalid JSON");
+    let me: serde_json::Value = vc.get("/auth/me").json().expect("invalid JSON");
     let encrypted_privkey = json_to_bytes(&me["encrypted_private_key"]);
 
     let private_key =
@@ -852,15 +738,7 @@ pub fn run_grant_reshare(
         });
 
     // Fetch recipient's public key
-    let pk_resp = client
-        .get(format!("{}/users/public-key", effective_url))
-        .query(&[("email", to_email)])
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let pk_resp = vc.get_query_raw("/users/public-key", &[("email", to_email)]);
     if !pk_resp.status().is_success() {
         if pk_resp.status().as_u16() == 404 {
             eprintln!(
@@ -908,29 +786,19 @@ pub fn run_grant_reshare(
     let item_id = body["item_id"].as_str().unwrap_or("");
 
     // Create new grant for recipient
-    let resp = client
-        .post(format!("{}/grants", effective_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .json(&serde_json::json!({
-            "item_id": item_id,
-            "grantee_email": to_email,
-            "wrapped_key": new_wrapped_key,
-            "ephemeral_pubkey": new_eph_pubkey.to_vec(),
-            "policy": policy,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let result: serde_json::Value = resp.json().unwrap_or_default();
+    let result: serde_json::Value = vc
+        .post_json(
+            "/grants",
+            &serde_json::json!({
+                "item_id": item_id,
+                "grantee_email": to_email,
+                "wrapped_key": new_wrapped_key,
+                "ephemeral_pubkey": new_eph_pubkey.to_vec(),
+                "policy": policy,
+            }),
+        )
+        .json()
+        .unwrap_or_default();
     let new_grant_id = result["id"].as_str().unwrap_or("?");
     eprintln!(
         "Grant reshared: {} -> {} (new grant ID: {})",
@@ -938,20 +806,17 @@ pub fn run_grant_reshare(
     );
 }
 
-pub fn run_grant_resend(client: &reqwest::blocking::Client, api_url: &str, grant_id: &str) {
+pub fn run_grant_resend(api_url: &str, grant_id: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .post(format!("{}/grants/{}/resend", api_url, grant_id))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let vc = VaultClient::new(api_url, &session.jwt);
+    let resp = vc.post_json_raw(
+        &format!("/grants/{}/resend", grant_id),
+        &serde_json::json!({}),
+    );
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();

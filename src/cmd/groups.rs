@@ -44,28 +44,11 @@ fn decrypt_group_name_from_json(
 }
 
 fn fetch_groups_decrypted(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    jwt: &str,
+    vc: &VaultClient,
     master_key: &MasterKey,
     user_id: &str,
 ) -> Vec<(String, String, serde_json::Value)> {
-    let resp = client
-        .get(format!("{}/groups", api_url))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let groups: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let groups: Vec<serde_json::Value> = vc.get("/groups").json().expect("invalid JSON");
     let mut result = Vec::new();
     for group in groups {
         let id = group["id"].as_str().unwrap_or("").to_string();
@@ -77,9 +60,7 @@ fn fetch_groups_decrypted(
 }
 
 fn resolve_group_id(
-    client: &reqwest::blocking::Client,
-    api_url: &str,
-    jwt: &str,
+    vc: &VaultClient,
     master_key: &MasterKey,
     user_id: &str,
     name_or_id: &str,
@@ -89,7 +70,7 @@ fn resolve_group_id(
         return name_or_id.to_string();
     }
 
-    let groups = fetch_groups_decrypted(client, api_url, jwt, master_key, user_id);
+    let groups = fetch_groups_decrypted(vc, master_key, user_id);
     groups
         .iter()
         .find(|(_, name, _)| name == name_or_id)
@@ -114,27 +95,18 @@ fn run_create(client: &reqwest::blocking::Client, api_url: &str, name: &str) {
 
     let (blob_b64, wrapped_key, nonce) = encrypt_group_blob(master_key, &user_id, name);
 
-    let resp = client
-        .post(format!("{}/groups", auth.api_url()))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .json(&serde_json::json!({
-            "encrypted_blob": blob_b64,
-            "wrapped_key": wrapped_key,
-            "nonce": nonce,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let body: serde_json::Value = resp.json().unwrap_or_default();
+    let vc = VaultClient::from_auth(&auth);
+    let body: serde_json::Value = vc
+        .post_json(
+            "/groups",
+            &serde_json::json!({
+                "encrypted_blob": blob_b64,
+                "wrapped_key": wrapped_key,
+                "nonce": nonce,
+            }),
+        )
+        .json()
+        .unwrap_or_default();
     let id = body["id"].as_str().unwrap_or("?");
     eprintln!("Group '{}' created (ID: {}).", name, id);
 }
@@ -151,7 +123,8 @@ fn run_list(client: &reqwest::blocking::Client, api_url: &str, json: bool) {
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
 
-    let groups = fetch_groups_decrypted(client, auth.api_url(), auth.jwt(), master_key, &user_id);
+    let vc = VaultClient::from_auth(&auth);
+    let groups = fetch_groups_decrypted(&vc, master_key, &user_id);
 
     if json {
         let out: Vec<_> = groups
@@ -185,14 +158,8 @@ fn run_show(client: &reqwest::blocking::Client, api_url: &str, group: &str, json
     };
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let group_id = resolve_group_id(
-        client,
-        auth.api_url(),
-        auth.jwt(),
-        master_key,
-        &user_id,
-        group,
-    );
+    let vc = VaultClient::from_auth(&auth);
+    let group_id = resolve_group_id(&vc, master_key, &user_id, group);
 
     // Fetch items in this group
     run_items_by_id(
@@ -217,36 +184,19 @@ fn run_rename(client: &reqwest::blocking::Client, api_url: &str, group: &str, ne
     };
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let group_id = resolve_group_id(
-        client,
-        auth.api_url(),
-        auth.jwt(),
-        master_key,
-        &user_id,
-        group,
-    );
+    let vc = VaultClient::from_auth(&auth);
+    let group_id = resolve_group_id(&vc, master_key, &user_id, group);
 
     let (blob_b64, wrapped_key, nonce) = encrypt_group_blob(master_key, &user_id, new_name);
 
-    let resp = client
-        .put(format!("{}/groups/{}", auth.api_url(), group_id))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .json(&serde_json::json!({
+    vc.put_json(
+        &format!("/groups/{}", group_id),
+        &serde_json::json!({
             "encrypted_blob": blob_b64,
             "wrapped_key": wrapped_key,
             "nonce": nonce,
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
+        }),
+    );
 
     eprintln!("Group renamed to '{}'.", new_name);
 }
@@ -262,30 +212,10 @@ fn run_delete(client: &reqwest::blocking::Client, api_url: &str, group: &str) {
     };
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let group_id = resolve_group_id(
-        client,
-        auth.api_url(),
-        auth.jwt(),
-        master_key,
-        &user_id,
-        group,
-    );
+    let vc = VaultClient::from_auth(&auth);
+    let group_id = resolve_group_id(&vc, master_key, &user_id, group);
 
-    let resp = client
-        .delete(format!("{}/groups/{}", auth.api_url(), group_id))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
+    vc.delete(&format!("/groups/{}", group_id));
     eprintln!("Group deleted.");
 }
 
@@ -300,14 +230,8 @@ fn run_add(client: &reqwest::blocking::Client, api_url: &str, group: &str, label
     };
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let group_id = resolve_group_id(
-        client,
-        auth.api_url(),
-        auth.jwt(),
-        master_key,
-        &user_id,
-        group,
-    );
+    let vc = VaultClient::from_auth(&auth);
+    let group_id = resolve_group_id(&vc, master_key, &user_id, group);
 
     // Resolve item by label
     let secrets = fetch_and_decrypt_secrets(client, &auth);
@@ -319,21 +243,10 @@ fn run_add(client: &reqwest::blocking::Client, api_url: &str, group: &str, label
             std::process::exit(1);
         });
 
-    let resp = client
-        .post(format!("{}/groups/{}/items", auth.api_url(), group_id))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .json(&serde_json::json!({ "item_id": item_id }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
+    vc.post_json(
+        &format!("/groups/{}/items", group_id),
+        &serde_json::json!({ "item_id": item_id }),
+    );
 
     eprintln!("Item '{}' added to group.", label);
 }
@@ -349,14 +262,8 @@ fn run_remove(client: &reqwest::blocking::Client, api_url: &str, group: &str, la
     };
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let group_id = resolve_group_id(
-        client,
-        auth.api_url(),
-        auth.jwt(),
-        master_key,
-        &user_id,
-        group,
-    );
+    let vc = VaultClient::from_auth(&auth);
+    let group_id = resolve_group_id(&vc, master_key, &user_id, group);
 
     // Resolve item by label
     let secrets = fetch_and_decrypt_secrets(client, &auth);
@@ -368,26 +275,7 @@ fn run_remove(client: &reqwest::blocking::Client, api_url: &str, group: &str, la
             std::process::exit(1);
         });
 
-    let resp = client
-        .delete(format!(
-            "{}/groups/{}/items/{}",
-            auth.api_url(),
-            group_id,
-            item_id
-        ))
-        .header("Authorization", format!("Bearer {}", auth.jwt()))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
+    vc.delete(&format!("/groups/{}/items/{}", group_id, item_id));
     eprintln!("Item '{}' removed from group.", label);
 }
 
@@ -402,14 +290,8 @@ fn run_items(client: &reqwest::blocking::Client, api_url: &str, group: &str, jso
     };
 
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let group_id = resolve_group_id(
-        client,
-        auth.api_url(),
-        auth.jwt(),
-        master_key,
-        &user_id,
-        group,
-    );
+    let vc = VaultClient::from_auth(&auth);
+    let group_id = resolve_group_id(&vc, master_key, &user_id, group);
 
     run_items_by_id(
         client,
@@ -431,22 +313,11 @@ fn run_items_by_id(
     group_id: &str,
     json: bool,
 ) {
-    let resp = client
-        .get(format!("{}/groups/{}/items", api_url, group_id))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let items: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
+    let vc = VaultClient::new(api_url, jwt);
+    let items: Vec<serde_json::Value> = vc
+        .get(&format!("/groups/{}/items", group_id))
+        .json()
+        .expect("invalid JSON");
 
     let enc_key = derive_subkey(master_key, b"vault-enc").unwrap_or_else(|e| {
         eprintln!("error: {}", e);

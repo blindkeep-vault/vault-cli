@@ -17,12 +17,12 @@ pub fn run_apikey(client: &reqwest::blocking::Client, api_url: &str, action: cra
             scoped,
             expires.as_deref(),
         ),
-        crate::ApikeyAction::List => run_apikey_list(client, api_url),
-        crate::ApikeyAction::Revoke { id } => run_apikey_revoke(client, api_url, &id),
+        crate::ApikeyAction::List => run_apikey_list(api_url),
+        crate::ApikeyAction::Revoke { id } => run_apikey_revoke(api_url, &id),
         crate::ApikeyAction::Grant { key_id, label } => {
             run_apikey_grant(client, api_url, &key_id, &label)
         }
-        crate::ApikeyAction::Grants { key_id } => run_apikey_grants(client, api_url, &key_id),
+        crate::ApikeyAction::Grants { key_id } => run_apikey_grants(api_url, &key_id),
         crate::ApikeyAction::Ungrant { key_id, label } => {
             run_apikey_ungrant(client, api_url, &key_id, &label)
         }
@@ -42,6 +42,8 @@ pub fn run_apikey_create(
         eprintln!("error: not logged in. Run `vault-cli login` first");
         std::process::exit(1);
     });
+
+    let vc = VaultClient::new(api_url, &session.jwt);
 
     #[allow(clippy::type_complexity)]
     let (secret, key_prefix, auth_key_hex, wrapped_master_key, encrypted_private_key, public_key): (
@@ -83,19 +85,7 @@ pub fn run_apikey_create(
         });
 
         // Get user's encrypted_private_key from /auth/me
-        let me_resp = client
-            .get(format!("{}/auth/me", api_url))
-            .header("Authorization", format!("Bearer {}", session.jwt))
-            .send()
-            .unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            });
-        if !me_resp.status().is_success() {
-            eprintln!("error: session expired. Run `vault-cli login` again");
-            std::process::exit(1);
-        }
-        let me: serde_json::Value = me_resp.json().expect("invalid JSON");
+        let me: serde_json::Value = vc.get("/auth/me").json().expect("invalid JSON");
         let epk = json_to_bytes(&me["encrypted_private_key"]);
 
         (
@@ -134,23 +124,10 @@ pub fn run_apikey_create(
         body["expires_at"] = serde_json::Value::String(exp);
     }
 
-    let resp = client
-        .post(format!("{}/api-keys", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .json(&body)
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: failed to create API key: {}", text);
-        std::process::exit(1);
-    }
-
-    let result: serde_json::Value = resp.json().expect("invalid JSON");
+    let result: serde_json::Value = vc
+        .post_json("/api-keys", &body)
+        .json()
+        .expect("invalid JSON");
     let display_key = format!(
         "vk_{}_{}",
         hex::encode(&secret[..4]),
@@ -176,28 +153,15 @@ pub fn run_apikey_create(
     eprintln!("Usage: export VAULT_API_KEY={}", display_key);
 }
 
-pub fn run_apikey_list(client: &reqwest::blocking::Client, api_url: &str) {
+pub fn run_apikey_list(api_url: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .get(format!("{}/api-keys", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let vc = VaultClient::new(api_url, &session.jwt);
+    let keys: Vec<serde_json::Value> = vc.get("/api-keys").json().expect("invalid JSON");
 
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let keys: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
     if keys.is_empty() {
         eprintln!("No API keys found.");
         return;
@@ -229,27 +193,14 @@ pub fn run_apikey_list(client: &reqwest::blocking::Client, api_url: &str) {
     }
 }
 
-pub fn run_apikey_revoke(client: &reqwest::blocking::Client, api_url: &str, id: &str) {
+pub fn run_apikey_revoke(api_url: &str, id: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .delete(format!("{}/api-keys/{}", api_url, id))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
+    let vc = VaultClient::new(api_url, &session.jwt);
+    vc.delete(&format!("/api-keys/{}", id));
     eprintln!("API key revoked.");
 }
 
@@ -264,6 +215,8 @@ pub fn run_apikey_grant(
         std::process::exit(1);
     });
 
+    let vc = VaultClient::new(api_url, &session.jwt);
+
     let password = prompt_password("Password: ");
     let login =
         vault_core::client::prepare_login(&password, &session.client_salt).unwrap_or_else(|e| {
@@ -272,19 +225,7 @@ pub fn run_apikey_grant(
         });
 
     // Find the API key's public key
-    let keys_resp = client
-        .get(format!("{}/api-keys", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !keys_resp.status().is_success() {
-        eprintln!("error: failed to list API keys");
-        std::process::exit(1);
-    }
-    let keys: Vec<serde_json::Value> = keys_resp.json().expect("invalid JSON");
+    let keys: Vec<serde_json::Value> = vc.get("/api-keys").json().expect("invalid JSON");
     let api_key = keys
         .iter()
         .find(|k| k["id"].as_str() == Some(key_id))
@@ -318,19 +259,10 @@ pub fn run_apikey_grant(
         _ => unreachable!(),
     };
     let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
-    let item_resp = client
-        .get(format!("{}/items/{}", api_url, item_id))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !item_resp.status().is_success() {
-        eprintln!("error: failed to fetch item");
-        std::process::exit(1);
-    }
-    let item: serde_json::Value = item_resp.json().expect("invalid JSON");
+    let item: serde_json::Value = vc
+        .get(&format!("/items/{}", item_id))
+        .json()
+        .expect("invalid JSON");
     let wrapped_key = json_to_bytes(&item["wrapped_key"]);
     let nonce = json_to_bytes(&item["nonce"]);
 
@@ -342,52 +274,31 @@ pub fn run_apikey_grant(
             });
 
     // POST the grant
-    let resp = client
-        .post(format!("{}/api-keys/{}/grants", api_url, key_id))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .json(&serde_json::json!({
+    vc.post_json(
+        &format!("/api-keys/{}/grants", key_id),
+        &serde_json::json!({
             "item_id": item_id,
             "wrapped_key": grant_wrap.wrapped_key,
             "ephemeral_pubkey": grant_wrap.ephemeral_pubkey.to_vec(),
             "nonce": grant_wrap.nonce.to_vec(),
-        }))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
+        }),
+    );
 
     eprintln!("Granted '{}' to API key {}.", label, key_id);
 }
 
-pub fn run_apikey_grants(client: &reqwest::blocking::Client, api_url: &str, key_id: &str) {
+pub fn run_apikey_grants(api_url: &str, key_id: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in");
         std::process::exit(1);
     });
 
-    let resp = client
-        .get(format!("{}/api-keys/{}/grants", api_url, key_id))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
+    let vc = VaultClient::new(api_url, &session.jwt);
+    let grants: Vec<serde_json::Value> = vc
+        .get(&format!("/api-keys/{}/grants", key_id))
+        .json()
+        .expect("invalid JSON");
 
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
-    let grants: Vec<serde_json::Value> = resp.json().expect("invalid JSON");
     if grants.is_empty() {
         eprintln!("No items granted to this API key.");
         return;
@@ -416,6 +327,8 @@ pub fn run_apikey_ungrant(
         std::process::exit(1);
     });
 
+    let vc = VaultClient::new(api_url, &session.jwt);
+
     let password = prompt_password("Password: ");
     let login =
         vault_core::client::prepare_login(&password, &session.client_salt).unwrap_or_else(|e| {
@@ -438,20 +351,10 @@ pub fn run_apikey_ungrant(
         });
 
     // Fetch grants for this key, find the one matching the item
-    let grants_resp = client
-        .get(format!("{}/api-keys/{}/grants", api_url, key_id))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !grants_resp.status().is_success() {
-        let text = grants_resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-    let grants: Vec<serde_json::Value> = grants_resp.json().expect("invalid JSON");
+    let grants: Vec<serde_json::Value> = vc
+        .get(&format!("/api-keys/{}/grants", key_id))
+        .json()
+        .expect("invalid JSON");
     let grant = grants
         .iter()
         .find(|g| g["item_id"].as_str() == Some(target_item_id.as_str()))
@@ -461,47 +364,20 @@ pub fn run_apikey_ungrant(
         });
     let grant_id = grant["id"].as_str().unwrap();
 
-    let resp = client
-        .delete(format!(
-            "{}/api-keys/{}/grants/{}",
-            api_url, key_id, grant_id
-        ))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: {}", text);
-        std::process::exit(1);
-    }
-
+    vc.delete(&format!("/api-keys/{}/grants/{}", key_id, grant_id));
     eprintln!("Revoked '{}' from API key {}.", label, key_id);
 }
 
-pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_ref: &str) {
+pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key_ref: &str) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in. Run `vault-cli login` first");
         std::process::exit(1);
     });
 
+    let vc = VaultClient::new(api_url, &session.jwt);
+
     // Find the key to rotate by ID or prefix
-    let keys_resp = client
-        .get(format!("{}/api-keys", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-    if !keys_resp.status().is_success() {
-        eprintln!("error: failed to list API keys");
-        std::process::exit(1);
-    }
-    let keys: Vec<serde_json::Value> = keys_resp.json().expect("invalid JSON");
+    let keys: Vec<serde_json::Value> = vc.get("/api-keys").json().expect("invalid JSON");
     let old_key = keys
         .iter()
         .find(|k| k["id"].as_str() == Some(key_ref) || k["key_prefix"].as_str() == Some(key_ref))
@@ -562,14 +438,7 @@ pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_
             std::process::exit(1);
         });
 
-        let me_resp = client
-            .get(format!("{}/auth/me", api_url))
-            .header("Authorization", format!("Bearer {}", session.jwt))
-            .send()
-            .unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            });
+        let me_resp = vc.get_raw("/auth/me");
         if !me_resp.status().is_success() {
             eprintln!("error: session expired. Run `vault-cli login` again");
             std::process::exit(1);
@@ -601,23 +470,10 @@ pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_
         body["public_key"] = serde_json::json!(pk);
     }
 
-    let resp = client
-        .post(format!("{}/api-keys", api_url))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .json(&body)
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
-        let text = resp.text().unwrap_or_default();
-        eprintln!("error: failed to create new API key: {}", text);
-        std::process::exit(1);
-    }
-
-    let new_key_resp: serde_json::Value = resp.json().expect("invalid JSON");
+    let new_key_resp: serde_json::Value = vc
+        .post_json("/api-keys", &body)
+        .json()
+        .expect("invalid JSON");
     let new_id = new_key_resp["id"].as_str().unwrap().to_string();
 
     // Re-grant items if scoped
@@ -643,30 +499,19 @@ pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_
             });
         let user_id = load_session().map(|s| s.user_id).unwrap_or_default();
 
-        let grants_resp = client
-            .get(format!("{}/api-keys/{}/grants", api_url, old_id))
-            .header("Authorization", format!("Bearer {}", session.jwt))
-            .send()
-            .unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            });
+        let grants_resp = vc.get_raw(&format!("/api-keys/{}/grants", old_id));
         if grants_resp.status().is_success() {
             let grants: Vec<serde_json::Value> = grants_resp.json().expect("invalid JSON");
             for grant in &grants {
                 let item_id = grant["item_id"].as_str().unwrap_or("");
 
                 // Fetch item to get wrapped_key + nonce
-                let item_resp = client
-                    .get(format!("{}/items/{}", api_url, item_id))
-                    .header("Authorization", format!("Bearer {}", session.jwt))
-                    .send();
-                let item: serde_json::Value = match item_resp {
-                    Ok(r) if r.status().is_success() => r.json().unwrap_or_default(),
-                    _ => {
-                        eprintln!("warning: could not fetch item {}, skipping grant", item_id);
-                        continue;
-                    }
+                let item_resp = vc.get_raw(&format!("/items/{}", item_id));
+                let item: serde_json::Value = if item_resp.status().is_success() {
+                    item_resp.json().unwrap_or_default()
+                } else {
+                    eprintln!("warning: could not fetch item {}, skipping grant", item_id);
+                    continue;
                 };
 
                 let wrapped_key = json_to_bytes(&item["wrapped_key"]);
@@ -687,40 +532,28 @@ pub fn run_apikey_rotate(client: &reqwest::blocking::Client, api_url: &str, key_
                     }
                 };
 
-                let resp = client
-                    .post(format!("{}/api-keys/{}/grants", api_url, new_id))
-                    .header("Authorization", format!("Bearer {}", session.jwt))
-                    .json(&serde_json::json!({
+                let resp = vc.post_json_raw(
+                    &format!("/api-keys/{}/grants", new_id),
+                    &serde_json::json!({
                         "item_id": item_id,
                         "wrapped_key": grant_wrap.wrapped_key,
                         "ephemeral_pubkey": grant_wrap.ephemeral_pubkey.to_vec(),
                         "nonce": grant_wrap.nonce.to_vec(),
-                    }))
-                    .send();
+                    }),
+                );
 
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        eprintln!("  Re-granted item {}", item_id);
-                    }
-                    _ => {
-                        eprintln!("warning: failed to re-grant item {}", item_id);
-                    }
+                if resp.status().is_success() {
+                    eprintln!("  Re-granted item {}", item_id);
+                } else {
+                    eprintln!("warning: failed to re-grant item {}", item_id);
                 }
             }
         }
     }
 
-    // Revoke old key
-    let resp = client
-        .delete(format!("{}/api-keys/{}", api_url, old_id))
-        .header("Authorization", format!("Bearer {}", session.jwt))
-        .send()
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            std::process::exit(1);
-        });
-
-    if !resp.status().is_success() {
+    // Revoke old key (use raw to avoid exiting on failure — the new key is already created)
+    let del_resp = vc.delete_raw(&format!("/api-keys/{}", old_id));
+    if !del_resp.status().is_success() {
         eprintln!(
             "warning: new key created but failed to revoke old key {}",
             old_id
