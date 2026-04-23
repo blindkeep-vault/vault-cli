@@ -5,6 +5,8 @@ pub fn run_put(
     api_url: &str,
     label: &str,
     value: Option<&str>,
+    one_shot_retrievable: bool,
+    notarize_on_use: bool,
 ) {
     let auth = get_auth(client, api_url);
 
@@ -43,16 +45,21 @@ pub fn run_put(
                 std::process::exit(1);
             });
 
+    let mut body = serde_json::json!({
+        "encrypted_blob": prepared.encrypted_blob_b64,
+        "wrapped_key": prepared.wrapped_key,
+        "nonce": prepared.nonce.to_vec(),
+        "item_type": "encrypted",
+    });
+    if one_shot_retrievable {
+        body["one_shot"] = serde_json::json!(true);
+    }
+    if notarize_on_use {
+        body["notarize_on_use"] = serde_json::json!(true);
+    }
+
     let vc = VaultClient::from_auth(&auth);
-    vc.post_json(
-        "/items",
-        &serde_json::json!({
-            "encrypted_blob": prepared.encrypted_blob_b64,
-            "wrapped_key": prepared.wrapped_key,
-            "nonce": prepared.nonce.to_vec(),
-            "item_type": "encrypted",
-        }),
-    );
+    vc.post_json("/items", &body);
 
     eprintln!("Secret '{}' stored.", label);
 }

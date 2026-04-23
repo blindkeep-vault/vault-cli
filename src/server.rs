@@ -665,14 +665,7 @@ async fn access_grant(
 
     // Policy checks
     let policy: vault_core::Policy =
-        serde_json::from_value(grant.policy.clone()).unwrap_or_else(|_| vault_core::Policy {
-            expires_at: None,
-            ttl_seconds: None,
-            max_views: None,
-            allowed_ops: vec!["view".into(), "download".into()],
-            notify_on_access: false,
-            ip_allowlist: None,
-        });
+        serde_json::from_value(grant.policy.clone()).unwrap_or_default();
     let operation = body.map(|b| b.0.operation).unwrap_or_else(|| "view".into());
     let now = chrono::Utc::now();
 

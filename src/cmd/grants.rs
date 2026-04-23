@@ -8,6 +8,8 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
             max_views,
             expires,
             read_only,
+            one_shot,
+            notarize_on_use,
         } => run_grant_create(
             client,
             api_url,
@@ -16,6 +18,8 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
             max_views,
             expires.as_deref(),
             read_only,
+            one_shot,
+            notarize_on_use,
         ),
         crate::GrantAction::List { sent, received } => run_grant_list(api_url, sent, received),
         crate::GrantAction::Access { id, output } => run_grant_access(client, api_url, &id, output),
@@ -48,6 +52,7 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_grant_create(
     client: &reqwest::blocking::Client,
     api_url: &str,
@@ -56,6 +61,8 @@ pub fn run_grant_create(
     max_views: Option<u32>,
     expires: Option<&str>,
     read_only: bool,
+    one_shot: bool,
+    notarize_on_use: bool,
 ) {
     let auth = get_auth(client, api_url);
     let (jwt, master_key, effective_url) = match &auth {
@@ -136,8 +143,16 @@ pub fn run_grant_create(
         "allowed_ops": allowed_ops,
         "notify_on_access": false,
     });
-    if let Some(n) = max_views {
+    // --one-shot implies max_views=1 unless caller passed a different value.
+    let effective_max_views = max_views.or(if one_shot { Some(1) } else { None });
+    if let Some(n) = effective_max_views {
         policy["max_views"] = serde_json::json!(n);
+    }
+    if one_shot {
+        policy["one_shot"] = serde_json::json!(true);
+    }
+    if notarize_on_use {
+        policy["notarize_on_use"] = serde_json::json!(true);
     }
     if let Some(exp) = expires {
         let duration = parse_duration(exp).unwrap_or_else(|e| {
@@ -250,7 +265,10 @@ pub fn run_grant_access(
         let text = resp.text().unwrap_or_default();
         match status {
             403 => eprintln!("error: access denied (grant may be expired or policy violation)"),
-            404 => eprintln!("error: grant not found or revoked"),
+            404 => eprintln!("error: grant not found"),
+            410 => {
+                eprintln!("error: grant has been consumed or revoked and is no longer retrievable")
+            }
             _ => eprintln!("error: {}", text),
         }
         std::process::exit(1);
@@ -477,7 +495,7 @@ pub fn run_grant_create_link(
     let grant_id = body["id"].as_str().unwrap_or("?");
 
     // Build share URL
-    let claim_key_b64 = URL_SAFE_NO_PAD.encode(&*lg.claim_key);
+    let claim_key_b64 = URL_SAFE_NO_PAD.encode(*lg.claim_key);
     let base_url = effective_url
         .replace("://api.", "://app.")
         .replace("://localhost:3000", "://localhost:8080");

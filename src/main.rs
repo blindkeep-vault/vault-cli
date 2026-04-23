@@ -100,6 +100,12 @@ pub(crate) enum Command {
         label: String,
         /// Secret value (omit to read from stdin, prefix with @ for file)
         value: Option<String>,
+        /// Consume this secret on first successful retrieval — subsequent reads return 410 Gone.
+        #[arg(long)]
+        one_shot_retrievable: bool,
+        /// Emit a notarized item.retrieve attestation on successful retrieval.
+        #[arg(long)]
+        notarize_on_use: bool,
     },
     /// Retrieve a secret
     Get {
@@ -314,6 +320,12 @@ pub(crate) enum GrantAction {
         /// Grant read-only access (view only, no download)
         #[arg(long)]
         read_only: bool,
+        /// Auto-revoke after a single successful retrieval. Implies --max-views=1 if not set.
+        #[arg(long)]
+        one_shot: bool,
+        /// Emit a notarized grant.retrieve attestation on each successful access.
+        #[arg(long)]
+        notarize_on_use: bool,
     },
     /// List grants (sent and received)
     List {
@@ -613,11 +625,23 @@ fn main() {
         Some(Command::Status) => {
             cmd::auth::run_status(&cli.api_url);
         }
-        Some(Command::Put { label, value }) => {
+        Some(Command::Put {
+            label,
+            value,
+            one_shot_retrievable,
+            notarize_on_use,
+        }) => {
             if value.is_some() {
                 eprintln!("warning: passing secrets as CLI arguments is visible in process listings; prefer stdin or @file");
             }
-            cmd::secrets::run_put(&client, &cli.api_url, &label, value.as_deref());
+            cmd::secrets::run_put(
+                &client,
+                &cli.api_url,
+                &label,
+                value.as_deref(),
+                one_shot_retrievable,
+                notarize_on_use,
+            );
         }
         Some(Command::Get { label, output }) => {
             cmd::secrets::run_get(&client, &cli.api_url, &label, output);

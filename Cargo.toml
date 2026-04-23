@@ -3,6 +3,10 @@ name = "vault-cli"
 version = "0.1.0"
 edition = "2021"
 
+# Self-root the workspace so cargo does not walk up past a worktree's
+# excluding Cargo.toml into the outer monorepo. See vault-core/Cargo.toml.
+[workspace]
+
 [dependencies]
 vault-core = { git = "ssh://git@github.com/blindkeep-vault/vault-core.git", features = ["client"] }
 clap = { version = "4", features = ["derive", "env"] }
