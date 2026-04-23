@@ -437,6 +437,7 @@ async fn create_item(
         &body.wrapped_key,
         &body.nonce,
         &body.item_type,
+        body.classification.as_str(),
         &metadata,
         body.size_bytes,
         body.file_blob_key.as_deref(),

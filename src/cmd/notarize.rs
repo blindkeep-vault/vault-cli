@@ -9,6 +9,7 @@ pub fn run_notarize(
     input: &str,
     item_id: Option<&str>,
     output: Option<PathBuf>,
+    rfc3161: bool,
 ) {
     // Determine if input is a hex hash or a file path
     let content_hash = if input.len() == 64 && input.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -55,13 +56,40 @@ pub fn run_notarize(
     let cert: serde_json::Value = cert_resp.json().expect("invalid certificate JSON");
     let cert_json = serde_json::to_string_pretty(&cert).unwrap();
 
-    let out_path = output
-        .unwrap_or_else(|| PathBuf::from(format!("notarization-{}.json", &notarization_id[..8])));
+    let out_path = default_cert_path(output, notarization_id);
     std::fs::write(&out_path, &cert_json).unwrap_or_else(|e| {
         eprintln!("error writing {}: {}", out_path.display(), e);
         std::process::exit(1);
     });
     eprintln!("Certificate saved to {}", out_path.display());
+
+    if rfc3161 {
+        let tsr_resp = vc.get_raw(&format!("/notarizations/{}/tsr", notarization_id));
+        if !tsr_resp.status().is_success() {
+            eprintln!(
+                "warning: could not fetch RFC 3161 TSR (HTTP {})",
+                tsr_resp.status()
+            );
+            return;
+        }
+        let tsr_bytes = tsr_resp.bytes().unwrap_or_else(|e| {
+            eprintln!("error reading TSR body: {}", e);
+            std::process::exit(1);
+        });
+        let tsr_path = out_path.with_extension("tsr");
+        std::fs::write(&tsr_path, &tsr_bytes).unwrap_or_else(|e| {
+            eprintln!("error writing {}: {}", tsr_path.display(), e);
+            std::process::exit(1);
+        });
+        eprintln!("RFC 3161 TSR saved to {}", tsr_path.display());
+        eprintln!();
+        eprintln!("To verify:");
+        eprintln!("  curl -s {}/notary/tsa-cert.pem > tsa.pem", api_url);
+        eprintln!(
+            "  openssl ts -verify -in {} -data <original-file> -CAfile tsa.pem",
+            tsr_path.display()
+        );
+    }
 }
 
 pub fn run_verify(certificate_path: &std::path::Path, document: Option<&std::path::Path>) {
@@ -168,5 +196,65 @@ pub fn run_list_notarizations(_client: &reqwest::blocking::Client, api_url: &str
         let hash = r["content_hash"].as_str().unwrap_or("?");
         let hash_short = if hash.len() > 16 { &hash[..16] } else { hash };
         println!("{:<38} {:<26} {}...", id, ts, hash_short);
+    }
+}
+
+/// Resolve the JSON certificate path, defaulting to `notarization-<id8>.json`
+/// and appending `.json` to any caller-supplied path with no extension — so
+/// the JSON cert and the sibling `<stem>.tsr` (emitted via `with_extension`)
+/// always share a stem.
+fn default_cert_path(output: Option<PathBuf>, notarization_id: &str) -> PathBuf {
+    let mut p = output
+        .unwrap_or_else(|| PathBuf::from(format!("notarization-{}.json", &notarization_id[..8])));
+    if p.extension().is_none() {
+        p.set_extension("json");
+    }
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "abcdef0123456789";
+
+    #[test]
+    fn default_path_used_when_output_is_none() {
+        assert_eq!(
+            default_cert_path(None, ID),
+            PathBuf::from("notarization-abcdef01.json")
+        );
+    }
+
+    #[test]
+    fn extensionless_output_gets_json_appended() {
+        assert_eq!(
+            default_cert_path(Some(PathBuf::from("/tmp/foo")), ID),
+            PathBuf::from("/tmp/foo.json")
+        );
+    }
+
+    #[test]
+    fn explicit_json_extension_is_unchanged() {
+        assert_eq!(
+            default_cert_path(Some(PathBuf::from("/tmp/foo.json")), ID),
+            PathBuf::from("/tmp/foo.json")
+        );
+    }
+
+    #[test]
+    fn non_json_extension_is_respected() {
+        assert_eq!(
+            default_cert_path(Some(PathBuf::from("/tmp/foo.pdf")), ID),
+            PathBuf::from("/tmp/foo.pdf")
+        );
+    }
+
+    #[test]
+    fn tsr_sibling_shares_stem_for_extensionless_output() {
+        // Regression for #23: stems must match between JSON and TSR.
+        let cert = default_cert_path(Some(PathBuf::from("/tmp/foo")), ID);
+        let tsr = cert.with_extension("tsr");
+        assert_eq!(cert.file_stem(), tsr.file_stem());
     }
 }

@@ -7,6 +7,7 @@ pub fn run_put(
     value: Option<&str>,
     one_shot_retrievable: bool,
     notarize_on_use: bool,
+    classification: &str,
 ) {
     let auth = get_auth(client, api_url);
 
@@ -56,6 +57,12 @@ pub fn run_put(
     }
     if notarize_on_use {
         body["notarize_on_use"] = serde_json::json!(true);
+    }
+    // Only include the field when non-default to keep the request compact
+    // and backward-compatible with servers that predate the column. Clap
+    // has already validated the string against the four accepted values.
+    if classification != "standard" {
+        body["classification"] = serde_json::json!(classification);
     }
 
     let vc = VaultClient::from_auth(&auth);

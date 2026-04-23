@@ -13,6 +13,7 @@ pub mod http;
 pub mod inbox;
 pub mod notarize;
 pub mod secrets;
+pub mod watchdog;
 pub mod will;
 
 // Re-export shared imports + helpers for sub-modules via `use super::*;`

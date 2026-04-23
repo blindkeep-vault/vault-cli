@@ -2,6 +2,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+const ITEM_COLUMNS: &str = "id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, metadata, storage_backend, file_blob_key, size_bytes, classification, created_at, updated_at";
+
 pub struct Database {
     conn: Mutex<Connection>,
     blob_dir: PathBuf,
@@ -28,6 +30,7 @@ pub struct ItemRow {
     pub wrapped_key: Vec<u8>,
     pub nonce: Vec<u8>,
     pub item_type: String,
+    pub classification: String,
     pub metadata: serde_json::Value,
     pub storage_backend: String,
     pub file_blob_key: Option<String>,
@@ -74,6 +77,11 @@ impl Database {
         }
 
         let conn = Connection::open(db_path)?;
+        // rusqlite's default busy_timeout is 0, so SQLITE_BUSY fires immediately
+        // under any write contention. 5s is long enough to cover the
+        // migration's IMMEDIATE transaction on boot and any routine write
+        // contention during normal operation.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
         let db = Self {
@@ -81,7 +89,45 @@ impl Database {
             blob_dir,
         };
         db.init_schema()?;
+        db.migrate_items_classification()?;
         Ok(db)
+    }
+
+    /// Add `classification` to `items` for DBs created before the column
+    /// existed. Matches `migrations/033_item_classification.sql` on the
+    /// Postgres side. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe
+    /// via `PRAGMA table_info` first.
+    ///
+    /// The check-then-ALTER runs inside `BEGIN IMMEDIATE` so two processes
+    /// opening the same DB file at once can't both read "column missing" and
+    /// then race on the ALTER (which would fail the second caller with
+    /// "duplicate column name"). SQLite serializes IMMEDIATE writers via a
+    /// RESERVED lock; the `busy_timeout` configured in `open()` is what lets
+    /// the loser wait for the winner to commit rather than erroring out with
+    /// `SQLITE_BUSY`.
+    fn migrate_items_classification(&self) -> Result<(), rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_column: bool = {
+            let mut stmt = tx.prepare("PRAGMA table_info(items)")?;
+            let mut rows = stmt.query([])?;
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == "classification" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_column {
+            tx.execute_batch(
+                "ALTER TABLE items ADD COLUMN classification TEXT NOT NULL DEFAULT 'standard'
+                    CHECK (classification IN ('public','standard','confidential','restricted'));",
+            )?;
+        }
+        tx.commit()
     }
 
     fn init_schema(&self) -> Result<(), rusqlite::Error> {
@@ -116,6 +162,8 @@ impl Database {
                 storage_backend TEXT DEFAULT 'local',
                 file_blob_key TEXT,
                 size_bytes INTEGER,
+                classification TEXT NOT NULL DEFAULT 'standard'
+                    CHECK (classification IN ('public','standard','confidential','restricted')),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -273,6 +321,7 @@ impl Database {
         wrapped_key: &[u8],
         nonce: &[u8],
         item_type: &str,
+        classification: &str,
         metadata: &serde_json::Value,
         size_bytes: Option<i64>,
         file_blob_key: Option<&str>,
@@ -281,9 +330,9 @@ impl Database {
         let meta_str = serde_json::to_string(metadata).unwrap_or_default();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO items (id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, metadata, size_bytes, file_blob_key, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, meta_str, size_bytes, file_blob_key, now, now],
+            "INSERT INTO items (id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, classification, metadata, size_bytes, file_blob_key, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, classification, meta_str, size_bytes, file_blob_key, now, now],
         )?;
         drop(conn);
         self.get_item(id, owner_id).map(|i| i.unwrap())
@@ -291,51 +340,19 @@ impl Database {
 
     pub fn list_items(&self, owner_id: &str) -> Result<Vec<ItemRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, metadata, storage_backend, file_blob_key, size_bytes, created_at, updated_at FROM items WHERE owner_id = ?1 ORDER BY created_at DESC",
-        )?;
-        let rows = stmt.query_map(params![owner_id], |row| {
-            let meta_str: String = row.get(6)?;
-            Ok(ItemRow {
-                id: row.get(0)?,
-                owner_id: row.get(1)?,
-                encrypted_blob: row.get(2)?,
-                wrapped_key: row.get(3)?,
-                nonce: row.get(4)?,
-                item_type: row.get(5)?,
-                metadata: serde_json::from_str(&meta_str).unwrap_or_default(),
-                storage_backend: row.get(7)?,
-                file_blob_key: row.get(8)?,
-                size_bytes: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
-            })
-        })?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM items WHERE owner_id = ?1 ORDER BY created_at DESC",
+        ))?;
+        let rows = stmt.query_map(params![owner_id], Self::map_item_row)?;
         rows.collect()
     }
 
     pub fn get_item(&self, id: &str, owner_id: &str) -> Result<Option<ItemRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, metadata, storage_backend, file_blob_key, size_bytes, created_at, updated_at FROM items WHERE id = ?1 AND owner_id = ?2",
+            &format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1 AND owner_id = ?2"),
             params![id, owner_id],
-            |row| {
-                let meta_str: String = row.get(6)?;
-                Ok(ItemRow {
-                    id: row.get(0)?,
-                    owner_id: row.get(1)?,
-                    encrypted_blob: row.get(2)?,
-                    wrapped_key: row.get(3)?,
-                    nonce: row.get(4)?,
-                    item_type: row.get(5)?,
-                    metadata: serde_json::from_str(&meta_str).unwrap_or_default(),
-                    storage_backend: row.get(7)?,
-                    file_blob_key: row.get(8)?,
-                    size_bytes: row.get(9)?,
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
-                })
-            },
+            Self::map_item_row,
         )
         .optional()
     }
@@ -343,27 +360,30 @@ impl Database {
     pub fn get_item_any_owner(&self, id: &str) -> Result<Option<ItemRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, metadata, storage_backend, file_blob_key, size_bytes, created_at, updated_at FROM items WHERE id = ?1",
+            &format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1"),
             params![id],
-            |row| {
-                let meta_str: String = row.get(6)?;
-                Ok(ItemRow {
-                    id: row.get(0)?,
-                    owner_id: row.get(1)?,
-                    encrypted_blob: row.get(2)?,
-                    wrapped_key: row.get(3)?,
-                    nonce: row.get(4)?,
-                    item_type: row.get(5)?,
-                    metadata: serde_json::from_str(&meta_str).unwrap_or_default(),
-                    storage_backend: row.get(7)?,
-                    file_blob_key: row.get(8)?,
-                    size_bytes: row.get(9)?,
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
-                })
-            },
+            Self::map_item_row,
         )
         .optional()
+    }
+
+    fn map_item_row(row: &rusqlite::Row) -> Result<ItemRow, rusqlite::Error> {
+        let meta_str: String = row.get(6)?;
+        Ok(ItemRow {
+            id: row.get(0)?,
+            owner_id: row.get(1)?,
+            encrypted_blob: row.get(2)?,
+            wrapped_key: row.get(3)?,
+            nonce: row.get(4)?,
+            item_type: row.get(5)?,
+            metadata: serde_json::from_str(&meta_str).unwrap_or_default(),
+            storage_backend: row.get(7)?,
+            file_blob_key: row.get(8)?,
+            size_bytes: row.get(9)?,
+            classification: row.get(10)?,
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
+        })
     }
 
     pub fn delete_item(&self, id: &str, owner_id: &str) -> Result<bool, rusqlite::Error> {
@@ -558,5 +578,117 @@ impl Database {
             params![id, actor_id, action, resource_type, resource_id, details_str, now],
         )
         .ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mk_db() -> (Database, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("vault.db")).unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO users (id, email, auth_key_hash, public_key, encrypted_private_key, client_salt, created_at, updated_at)
+             VALUES ('user1', 'u@example.com', 'h', X'00', X'00', X'00', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        drop(conn);
+        (db, dir)
+    }
+
+    #[test]
+    fn create_item_roundtrips_classification() {
+        let (db, _dir) = mk_db();
+        let metadata = json!({});
+        for c in ["public", "standard", "confidential", "restricted"] {
+            let id = format!("item-{c}");
+            db.create_item(
+                &id,
+                "user1",
+                "",
+                &[0u8],
+                &[0u8],
+                "encrypted",
+                c,
+                &metadata,
+                None,
+                None,
+            )
+            .unwrap();
+            let row = db.get_item(&id, "user1").unwrap().unwrap();
+            assert_eq!(row.classification, c);
+        }
+    }
+
+    #[test]
+    fn create_item_rejects_unknown_classification() {
+        let (db, _dir) = mk_db();
+        let err = db.create_item(
+            "x",
+            "user1",
+            "",
+            &[0u8],
+            &[0u8],
+            "encrypted",
+            "secret",
+            &json!({}),
+            None,
+            None,
+        );
+        assert!(
+            err.is_err(),
+            "CHECK constraint must reject unknown classification"
+        );
+    }
+
+    #[test]
+    fn migration_adds_classification_column_to_old_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        // Simulate a pre-migration DB: open a raw connection, create an items
+        // table matching the pre-classification schema, and insert a row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (
+                    id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    encrypted_blob TEXT NOT NULL,
+                    wrapped_key BLOB NOT NULL,
+                    nonce BLOB NOT NULL,
+                    item_type TEXT NOT NULL DEFAULT 'encrypted',
+                    metadata TEXT DEFAULT '{}',
+                    storage_backend TEXT DEFAULT 'local',
+                    file_blob_key TEXT,
+                    size_bytes INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO items (id, owner_id, encrypted_blob, wrapped_key, nonce, item_type, metadata, created_at, updated_at)
+                 VALUES ('legacy', 'user1', '', X'00', X'00', 'encrypted', '{}', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+                [],
+            ).unwrap();
+        }
+        // Opening through Database::open must run the migration.
+        let db = Database::open(&path).unwrap();
+        let row = db.get_item_any_owner("legacy").unwrap().unwrap();
+        assert_eq!(row.classification, "standard");
+    }
+
+    #[test]
+    fn migration_is_idempotent_across_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        // First open creates the DB with the column.
+        let _ = Database::open(&path).unwrap();
+        // Second open must succeed — the PRAGMA probe sees the column and
+        // the IMMEDIATE transaction commits as a no-op.
+        let _ = Database::open(&path).unwrap();
     }
 }

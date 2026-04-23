@@ -65,6 +65,12 @@ pub(crate) enum Command {
         /// Output certificate file
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Also emit an RFC 3161 TimeStampResp alongside the JSON certificate.
+        /// Writes <stem>.tsr next to <stem>.json. Verify with
+        /// `openssl ts -verify -in <stem>.tsr -data <file> -CAfile <tsa.pem>`
+        /// where <tsa.pem> is fetched from `/notary/tsa-cert.pem`.
+        #[arg(long)]
+        rfc3161: bool,
     },
     /// Verify a notarization certificate
     Verify {
@@ -109,6 +115,13 @@ pub(crate) enum Command {
         /// retrieval. Same scope: direct reads only.
         #[arg(long)]
         notarize_on_use: bool,
+        /// Data-handling classification (issue #9). `standard` (default) keeps
+        /// today's behavior. `confidential` and `restricted` items require
+        /// `grant create --one-shot` — grants that aren't one-shot will be
+        /// refused by the server with 422.
+        #[arg(long, value_name = "LEVEL", default_value = "standard",
+              value_parser = ["public", "standard", "confidential", "restricted"])]
+        classification: String,
     },
     /// Retrieve a secret
     Get {
@@ -171,6 +184,11 @@ pub(crate) enum Command {
     Deadman {
         #[command(subcommand)]
         action: DeadmanAction,
+    },
+    /// Signed heartbeat / watchdog attestations
+    Watchdog {
+        #[command(subcommand)]
+        action: WatchdogAction,
     },
     /// Organize items into groups
     Group {
@@ -456,6 +474,38 @@ pub(crate) enum DeadmanAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum WatchdogAction {
+    /// Register a new watchdog session
+    Register {
+        /// Expected ping interval (e.g. "60", "30s", "5m", "2h", "1d")
+        #[arg(long)]
+        interval: String,
+        /// Allowed slack before the session is declared lost (default 0)
+        #[arg(long)]
+        tolerance: Option<String>,
+        /// Optional human-readable label
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Record a heartbeat for an existing session
+    Ping {
+        /// Session id (UUID)
+        id: String,
+    },
+    /// List all registered watchdog sessions
+    Query {
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retire a watchdog session (won't emit watchdog.lost)
+    Delete {
+        /// Session id (UUID)
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum GroupAction {
     /// Create a new group
     Create {
@@ -594,6 +644,7 @@ fn main() {
             token,
             item_id,
             output,
+            rfc3161,
         }) => {
             cmd::notarize::run_notarize(
                 &client,
@@ -602,6 +653,7 @@ fn main() {
                 &input,
                 item_id.as_deref(),
                 output,
+                rfc3161,
             );
         }
         Some(Command::Verify {
@@ -636,6 +688,7 @@ fn main() {
             value,
             one_shot_retrievable,
             notarize_on_use,
+            classification,
         }) => {
             if value.is_some() {
                 eprintln!("warning: passing secrets as CLI arguments is visible in process listings; prefer stdin or @file");
@@ -647,6 +700,7 @@ fn main() {
                 value.as_deref(),
                 one_shot_retrievable,
                 notarize_on_use,
+                &classification,
             );
         }
         Some(Command::Get { label, output }) => {
@@ -715,6 +769,9 @@ fn main() {
         },
         Some(Command::Deadman { action }) => {
             cmd::deadman::run_deadman(&client, &cli.api_url, action);
+        }
+        Some(Command::Watchdog { action }) => {
+            cmd::watchdog::run_watchdog(&client, &cli.api_url, action);
         }
         Some(Command::Group { action }) => {
             cmd::groups::run_group(&client, &cli.api_url, action);
