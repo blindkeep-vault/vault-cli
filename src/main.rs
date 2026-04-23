@@ -100,10 +100,13 @@ pub(crate) enum Command {
         label: String,
         /// Secret value (omit to read from stdin, prefix with @ for file)
         value: Option<String>,
-        /// Consume this secret on first successful retrieval — subsequent reads return 410 Gone.
+        /// Consume this secret on the first direct retrieval (API key or owner) —
+        /// subsequent reads return 410 Gone. Does NOT gate grant-based access; use
+        /// `grant create --one-shot` to enforce single-retrieval for a grantee.
         #[arg(long)]
         one_shot_retrievable: bool,
-        /// Emit a notarized item.retrieve attestation on successful retrieval.
+        /// Emit a notarized item.retrieve attestation on every successful direct
+        /// retrieval. Same scope: direct reads only.
         #[arg(long)]
         notarize_on_use: bool,
     },
@@ -320,10 +323,13 @@ pub(crate) enum GrantAction {
         /// Grant read-only access (view only, no download)
         #[arg(long)]
         read_only: bool,
-        /// Auto-revoke after a single successful retrieval. Implies --max-views=1 if not set.
+        /// Auto-revoke this grant after a single successful retrieval. The
+        /// revocation commits in the same UPDATE as the view count, and the
+        /// second access returns 410 Gone. Implies --max-views=1 if not set.
         #[arg(long)]
         one_shot: bool,
         /// Emit a notarized grant.retrieve attestation on each successful access.
+        /// The notarization commits in the same transaction as the retrieval.
         #[arg(long)]
         notarize_on_use: bool,
     },

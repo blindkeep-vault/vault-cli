@@ -52,6 +52,7 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
     }
 }
 
+// TODO: refactor args into a GrantCreateArgs struct to drop the allow.
 #[allow(clippy::too_many_arguments)]
 pub fn run_grant_create(
     client: &reqwest::blocking::Client,
