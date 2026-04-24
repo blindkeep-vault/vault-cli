@@ -153,6 +153,35 @@ pub fn run_ls(client: &reqwest::blocking::Client, api_url: &str, prefix: Option<
     }
 }
 
+pub fn run_reclassify(
+    client: &reqwest::blocking::Client,
+    api_url: &str,
+    label: &str,
+    to: &str,
+    acknowledge_grant_breakage: bool,
+) {
+    let auth = get_auth(client, api_url);
+    let secrets = fetch_and_decrypt_secrets(client, &auth);
+
+    let Some((item_id, _, _)) = secrets
+        .iter()
+        .find(|(_, blob, _)| blob.display_name() == label)
+    else {
+        eprintln!("error: secret '{}' not found", label);
+        std::process::exit(1);
+    };
+
+    let body = serde_json::json!({
+        "classification": to,
+        "acknowledge_grant_breakage": acknowledge_grant_breakage,
+    });
+
+    let vc = VaultClient::from_auth(&auth);
+    vc.patch_json(&format!("/items/{}/classification", item_id), &body);
+
+    eprintln!("Secret '{}' reclassified to '{}'.", label, to);
+}
+
 pub fn run_rm(client: &reqwest::blocking::Client, api_url: &str, label: &str) {
     let auth = get_auth(client, api_url);
     let secrets = fetch_and_decrypt_secrets(client, &auth);

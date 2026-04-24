@@ -141,6 +141,24 @@ pub(crate) enum Command {
         /// Secret label
         label: String,
     },
+    /// Change the classification level of an existing secret. Downgrades (any
+    /// move to a strictly less strict level, e.g. `restricted` → `standard`)
+    /// are notarized as `item.reclassify` events so the transition is
+    /// externally auditable per issue #9 acceptance.
+    Reclassify {
+        /// Secret label
+        label: String,
+        /// Target classification level
+        #[arg(long, value_name = "LEVEL",
+              value_parser = ["public", "standard", "confidential", "restricted"])]
+        to: String,
+        /// Proceed even if the new classification would leave an active or
+        /// pending grant non-compliant (e.g. reclassifying to `confidential`
+        /// when a non-one-shot grant exists). The grant is not rewritten —
+        /// the server flags the acknowledgement in the audit trail.
+        #[arg(long)]
+        acknowledge_grant_breakage: bool,
+    },
     /// Manage environment files
     Env {
         #[command(subcommand)]
@@ -711,6 +729,19 @@ fn main() {
         }
         Some(Command::Rm { label }) => {
             cmd::secrets::run_rm(&client, &cli.api_url, &label);
+        }
+        Some(Command::Reclassify {
+            label,
+            to,
+            acknowledge_grant_breakage,
+        }) => {
+            cmd::secrets::run_reclassify(
+                &client,
+                &cli.api_url,
+                &label,
+                &to,
+                acknowledge_grant_breakage,
+            );
         }
         Some(Command::Env { action }) => match action {
             EnvAction::Push { label, file } => {

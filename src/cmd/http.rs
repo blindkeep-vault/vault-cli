@@ -91,6 +91,17 @@ impl VaultClient {
         check(resp)
     }
 
+    pub fn patch_json<T: serde::Serialize>(&self, path: &str, body: &T) -> Response {
+        let resp = self
+            .client
+            .patch(self.url(path))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .unwrap_or_else(|e| fatal(&e));
+        check(resp)
+    }
+
     pub fn put_bytes(&self, path: &str, body: Vec<u8>) -> Response {
         let resp = self
             .client
