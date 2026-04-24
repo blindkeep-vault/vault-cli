@@ -122,6 +122,11 @@ pub(crate) enum Command {
         #[arg(long, value_name = "LEVEL", default_value = "standard",
               value_parser = ["public", "standard", "confidential", "restricted"])]
         classification: String,
+        /// Cascade-revocation tag (issue #7). Items created with the same
+        /// tag can later be revoked together via a single scope tombstone.
+        /// Format: 1-64 chars of [a-z0-9-_./], starting with [a-z0-9].
+        #[arg(long, value_name = "TAG")]
+        scope: Option<String>,
     },
     /// Retrieve a secret
     Get {
@@ -203,6 +208,14 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: DeadmanAction,
     },
+    /// Notarized approval-decision log (issue #5). Records and queries
+    /// "who decided what, when, and why" with cryptographic anchoring —
+    /// the rationale is encrypted client-side, the structured fields
+    /// (action, target, approver) drive a server-side query API.
+    Decision {
+        #[command(subcommand)]
+        action: DecisionAction,
+    },
     /// Signed heartbeat / watchdog attestations
     Watchdog {
         #[command(subcommand)]
@@ -222,6 +235,29 @@ pub(crate) enum Command {
     Will {
         #[command(subcommand)]
         action: WillAction,
+    },
+    /// Tombstone a scope: revoke every grant, api key, and api-key grant
+    /// carrying the tag, freeze tagged items read-only under a retention
+    /// window, and notarize the event (issue #7). The tombstone ledger
+    /// row permanently blocks new resources from rejoining the scope —
+    /// a new scope must be created instead.
+    Tombstone {
+        /// The scope tag to tombstone. Must match the tag used on the
+        /// original `--scope` flags (1-64 chars of `[a-z0-9-_./]`,
+        /// starting with `[a-z0-9]`).
+        scope_tag: String,
+        /// Retention window — how long frozen items remain before the
+        /// retention-expiry sweep disposes of them. Parsed as a
+        /// duration (e.g. "30d", "90d", "1y"); sub-day values round up
+        /// to the next full day. Server clamps into [1, 3650] days;
+        /// omit for the default (90 days).
+        #[arg(long)]
+        retention: Option<String>,
+        /// Free-form note persisted on the tombstone ledger row. Useful
+        /// for audit context (incident number, JIRA ticket, compliance
+        /// reference).
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Start a self-hosted BlindKeep-compatible API server
     Serve {
@@ -266,6 +302,11 @@ pub(crate) enum ApikeyAction {
         /// Expiry duration (e.g., "30d", "90d", "1y")
         #[arg(long)]
         expires: Option<String>,
+        /// Cascade-revocation tag (issue #7). Tags this key for a future
+        /// scope tombstone. Independent from `--scoped`/`--read-only`, which
+        /// are RBAC-style permissions. Format: 1-64 chars of [a-z0-9-_./].
+        #[arg(long, value_name = "TAG")]
+        scope: Option<String>,
     },
     /// List API keys
     List,
@@ -368,6 +409,11 @@ pub(crate) enum GrantAction {
         /// The notarization commits in the same transaction as the retrieval.
         #[arg(long)]
         notarize_on_use: bool,
+        /// Cascade-revocation tag (issue #7). Tags this grant for a future
+        /// scope tombstone — useful for grants issued to external
+        /// collaborators on a specific engagement or workspace.
+        #[arg(long, value_name = "TAG")]
+        scope: Option<String>,
     },
     /// List grants (sent and received)
     List {
@@ -489,6 +535,78 @@ pub(crate) enum DeadmanAction {
     Checkin,
     /// Disable deadman switch
     Disable,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DecisionAction {
+    /// Record a notarized approval decision. The rationale is encrypted
+    /// client-side; the structured fields are server-queryable (issue #5).
+    Record {
+        /// Action taken (e.g. "approve", "deny", "exception").
+        #[arg(long)]
+        action: String,
+        /// Target identifier (e.g. "wire-12345", "deploy-v2.3", "case-7").
+        #[arg(long)]
+        target: String,
+        /// Free-form rationale to encrypt. Use `@path` to read from a file,
+        /// or omit to read from stdin (matches `vault-cli put`).
+        #[arg(long)]
+        rationale: Option<String>,
+        /// Approver identity, defaults to the caller's user id. Pass an
+        /// explicit value when recording on behalf of an external party.
+        #[arg(long)]
+        approver: Option<String>,
+        /// Prior decision id this one supersedes. Server enforces both
+        /// belong to the same approver_user_id.
+        #[arg(long)]
+        supersedes: Option<String>,
+        /// Caller-supplied decision time (RFC 3339). Useful for backfilling
+        /// historical approvals; defaults to record time on the server.
+        #[arg(long)]
+        decided_at: Option<String>,
+    },
+    /// Fetch a single decision by id with its anchoring notarization.
+    /// Useful when you have a decision id from somewhere else (a chain
+    /// tip, an audit log entry) and want the full row without paginating.
+    Show {
+        /// Decision id (UUID).
+        id: String,
+        /// Output raw JSON instead of the human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Query the decision log. The server returns a notarized receipt
+    /// pinning the filter parameters and the result set, so completeness
+    /// is verifiable later.
+    Query {
+        /// Filter by approver identity (exact match).
+        #[arg(long)]
+        approver: Option<String>,
+        /// Filter by action (exact match).
+        #[arg(long)]
+        action: Option<String>,
+        /// Filter by target (exact match).
+        #[arg(long)]
+        target: Option<String>,
+        /// Lower bound on decided_at, inclusive (RFC 3339).
+        #[arg(long)]
+        since: Option<String>,
+        /// Upper bound on decided_at, exclusive (RFC 3339).
+        #[arg(long)]
+        until: Option<String>,
+        /// Filter by supersedes id (find decisions that follow a given prior).
+        #[arg(long)]
+        supersedes: Option<String>,
+        /// Page size (1..=500).
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Page offset.
+        #[arg(long)]
+        offset: Option<i64>,
+        /// Output raw JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -707,6 +825,7 @@ fn main() {
             one_shot_retrievable,
             notarize_on_use,
             classification,
+            scope,
         }) => {
             if value.is_some() {
                 eprintln!("warning: passing secrets as CLI arguments is visible in process listings; prefer stdin or @file");
@@ -719,6 +838,7 @@ fn main() {
                 one_shot_retrievable,
                 notarize_on_use,
                 &classification,
+                scope.as_deref(),
             );
         }
         Some(Command::Get { label, output }) => {
@@ -801,6 +921,55 @@ fn main() {
         Some(Command::Deadman { action }) => {
             cmd::deadman::run_deadman(&client, &cli.api_url, action);
         }
+        Some(Command::Decision { action }) => match action {
+            DecisionAction::Record {
+                action,
+                target,
+                rationale,
+                approver,
+                supersedes,
+                decided_at,
+            } => {
+                cmd::decisions::run_record(
+                    &client,
+                    &cli.api_url,
+                    &action,
+                    &target,
+                    rationale.as_deref(),
+                    approver.as_deref(),
+                    supersedes.as_deref(),
+                    decided_at.as_deref(),
+                );
+            }
+            DecisionAction::Show { id, json } => {
+                cmd::decisions::run_show(&client, &cli.api_url, &id, json);
+            }
+            DecisionAction::Query {
+                approver,
+                action,
+                target,
+                since,
+                until,
+                supersedes,
+                limit,
+                offset,
+                json,
+            } => {
+                cmd::decisions::run_query(
+                    &client,
+                    &cli.api_url,
+                    approver.as_deref(),
+                    action.as_deref(),
+                    target.as_deref(),
+                    since.as_deref(),
+                    until.as_deref(),
+                    supersedes.as_deref(),
+                    limit,
+                    offset,
+                    json,
+                );
+            }
+        },
         Some(Command::Watchdog { action }) => {
             cmd::watchdog::run_watchdog(&client, &cli.api_url, action);
         }
@@ -812,6 +981,19 @@ fn main() {
         }
         Some(Command::Will { action }) => {
             cmd::will::run_will(&client, &cli.api_url, action);
+        }
+        Some(Command::Tombstone {
+            scope_tag,
+            retention,
+            reason,
+        }) => {
+            cmd::tombstone::run_tombstone(
+                &client,
+                &cli.api_url,
+                &scope_tag,
+                retention.as_deref(),
+                reason.as_deref(),
+            );
         }
         Some(Command::Serve {
             port,

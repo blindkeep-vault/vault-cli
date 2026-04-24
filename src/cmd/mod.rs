@@ -4,6 +4,7 @@ pub mod auth;
 pub mod billing;
 pub mod common;
 pub mod deadman;
+pub mod decisions;
 pub mod drops;
 pub mod env;
 pub mod files;
@@ -13,6 +14,7 @@ pub mod http;
 pub mod inbox;
 pub mod notarize;
 pub mod secrets;
+pub mod tombstone;
 pub mod watchdog;
 pub mod will;
 

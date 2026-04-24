@@ -10,6 +10,7 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
             read_only,
             one_shot,
             notarize_on_use,
+            scope,
         } => run_grant_create(
             client,
             api_url,
@@ -20,6 +21,7 @@ pub fn run_grant(client: &reqwest::blocking::Client, api_url: &str, action: crat
             read_only,
             one_shot,
             notarize_on_use,
+            scope.as_deref(),
         ),
         crate::GrantAction::List { sent, received } => run_grant_list(api_url, sent, received),
         crate::GrantAction::Access { id, output } => run_grant_access(client, api_url, &id, output),
@@ -64,6 +66,7 @@ pub fn run_grant_create(
     read_only: bool,
     one_shot: bool,
     notarize_on_use: bool,
+    scope_tag: Option<&str>,
 ) {
     let auth = get_auth(client, api_url);
     let (jwt, master_key, effective_url) = match &auth {
@@ -165,22 +168,38 @@ pub fn run_grant_create(
     }
 
     // POST /grants
+    let mut req_body = serde_json::json!({
+        "item_id": item_id,
+        "grantee_email": to_email,
+        "wrapped_key": grant_wrapped_key,
+        "ephemeral_pubkey": ephemeral_pubkey.to_vec(),
+        "policy": policy,
+    });
+    if let Some(tag) = scope_tag {
+        if let Err(e) = vault_core::validate_scope_tag(tag) {
+            eprintln!("error: invalid --scope: {e}");
+            std::process::exit(1);
+        }
+        req_body["scope_tag"] = serde_json::json!(tag);
+    }
     let body: serde_json::Value = vc
-        .post_json(
-            "/grants",
-            &serde_json::json!({
-                "item_id": item_id,
-                "grantee_email": to_email,
-                "wrapped_key": grant_wrapped_key,
-                "ephemeral_pubkey": ephemeral_pubkey.to_vec(),
-                "policy": policy,
-            }),
-        )
+        .post_json("/grants", &req_body)
         .json()
         .unwrap_or_default();
     let grant_id = body["id"].as_str().unwrap_or("(unknown)");
     eprintln!("Grant created: {} -> {}", label, to_email);
     eprintln!("Grant ID: {}", grant_id);
+    // Echoed from the server when the caller passed --scope; closes the
+    // verify-on-write loop for the #7 revocation-cascade tag. Client-side
+    // revalidation (same rule the server enforced) guards against a
+    // misbehaving server smuggling terminal escape sequences through the
+    // echoed string — see the matching note in `cmd/apikey.rs`.
+    if let Some(tag) = body["scope_tag"]
+        .as_str()
+        .filter(|t| vault_core::validate_scope_tag(t).is_ok())
+    {
+        eprintln!("Scope tag: {tag}");
+    }
 }
 
 pub fn run_grant_list(api_url: &str, sent_only: bool, received_only: bool) {

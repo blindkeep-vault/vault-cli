@@ -9,6 +9,7 @@ pub fn run_apikey(client: &reqwest::blocking::Client, api_url: &str, action: cra
             read_only,
             scoped,
             expires,
+            scope,
         } => run_apikey_create(
             client,
             api_url,
@@ -16,6 +17,7 @@ pub fn run_apikey(client: &reqwest::blocking::Client, api_url: &str, action: cra
             read_only,
             scoped,
             expires.as_deref(),
+            scope.as_deref(),
         ),
         crate::ApikeyAction::List => run_apikey_list(api_url),
         crate::ApikeyAction::Revoke { id } => run_apikey_revoke(api_url, &id),
@@ -30,6 +32,7 @@ pub fn run_apikey(client: &reqwest::blocking::Client, api_url: &str, action: cra
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_apikey_create(
     client: &reqwest::blocking::Client,
     api_url: &str,
@@ -37,6 +40,7 @@ pub fn run_apikey_create(
     read_only: bool,
     scoped: bool,
     expires: Option<&str>,
+    scope_tag: Option<&str>,
 ) {
     let session = load_session().unwrap_or_else(|| {
         eprintln!("error: not logged in. Run `vault-cli login` first");
@@ -123,6 +127,13 @@ pub fn run_apikey_create(
     if let Some(exp) = expires_at {
         body["expires_at"] = serde_json::Value::String(exp);
     }
+    if let Some(tag) = scope_tag {
+        if let Err(e) = vault_core::validate_scope_tag(tag) {
+            eprintln!("error: invalid --scope: {e}");
+            std::process::exit(1);
+        }
+        body["scope_tag"] = serde_json::json!(tag);
+    }
 
     let result: serde_json::Value = vc
         .post_json("/api-keys", &body)
@@ -144,6 +155,23 @@ pub fn run_apikey_create(
     }
     if read_only {
         eprintln!("Scope: read-only");
+    }
+    // Echoed from the server — closes the verify-on-write loop for the
+    // #7 revocation-cascade tag. Named "Scope tag" to avoid colliding with
+    // the existing "Scope: read-only" line above, which refers to the
+    // unrelated RBAC `scopes` JSONB permissions map.
+    //
+    // Revalidate the echoed tag client-side: if a compromised or
+    // misbehaving server returned a malformed tag we'd rather skip the
+    // display line than print arbitrary bytes to the terminal, which
+    // could smuggle ANSI escape sequences. The validator is the same
+    // opaque-string check the CLI ran before sending, so a well-behaved
+    // server always satisfies it.
+    if let Some(tag) = result["scope_tag"]
+        .as_str()
+        .filter(|t| vault_core::validate_scope_tag(t).is_ok())
+    {
+        eprintln!("Scope tag: {tag}");
     }
     eprintln!();
     eprintln!("Key (shown once — store it securely):");

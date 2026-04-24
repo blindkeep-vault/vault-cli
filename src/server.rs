@@ -24,6 +24,10 @@ use crate::db::Database;
 pub struct ServerState {
     pub db: Database,
     pub jwt_secret: String,
+    /// Classification rule table, loaded at startup. See vault-core issue #43.
+    /// Defaults to the pre-refactor hardcoded table; operators override via
+    /// `CLASSIFICATION_POLICY_PATH` pointing at a JSON file.
+    pub classification_policy: vault_core::policy::classification::ClassificationPolicy,
 }
 
 type AppState = Arc<ServerState>;
@@ -591,7 +595,9 @@ async fn create_grant(
                     item.classification
                 ))
             })?;
-        vault_core::policy::classification::enforce_grant_policy(classification, &request_policy)?;
+        state
+            .classification_policy
+            .enforce_grant_policy(classification, &request_policy)?;
     }
 
     // Resolve grantee
@@ -794,7 +800,29 @@ pub async fn run_server(host: &str, port: u16, db_path: PathBuf) {
         }
     };
 
-    let state = Arc::new(ServerState { db, jwt_secret });
+    // Same env var loader as vault-api — operators can pin stricter handling
+    // on the CLI-embedded server too. Invalid path or malformed JSON is a
+    // hard startup error; absence of the var → default table.
+    let classification_policy = match std::env::var("CLASSIFICATION_POLICY_PATH") {
+        Ok(path) => {
+            let bytes = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                eprintln!("error: failed to read CLASSIFICATION_POLICY_PATH='{path}': {e}");
+                std::process::exit(1);
+            });
+            vault_core::policy::classification::ClassificationPolicy::from_json_str(&bytes)
+                .unwrap_or_else(|e| {
+                    eprintln!("error: CLASSIFICATION_POLICY_PATH='{path}': {e}");
+                    std::process::exit(1);
+                })
+        }
+        Err(_) => vault_core::policy::classification::ClassificationPolicy::default(),
+    };
+
+    let state = Arc::new(ServerState {
+        db,
+        jwt_secret,
+        classification_policy,
+    });
     let app = build_router(state);
 
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap_or_else(|e| {
@@ -858,6 +886,8 @@ mod tests {
         let state = Arc::new(ServerState {
             db,
             jwt_secret: jwt_secret.to_string(),
+            classification_policy:
+                vault_core::policy::classification::ClassificationPolicy::default(),
         });
         (state, dir, user_id)
     }

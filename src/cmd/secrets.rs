@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_put(
     client: &reqwest::blocking::Client,
     api_url: &str,
@@ -8,6 +9,7 @@ pub fn run_put(
     one_shot_retrievable: bool,
     notarize_on_use: bool,
     classification: &str,
+    scope_tag: Option<&str>,
 ) {
     let auth = get_auth(client, api_url);
 
@@ -64,11 +66,29 @@ pub fn run_put(
     if classification != "standard" {
         body["classification"] = serde_json::json!(classification);
     }
+    if let Some(tag) = scope_tag {
+        if let Err(e) = vault_core::validate_scope_tag(tag) {
+            eprintln!("error: invalid --scope: {e}");
+            std::process::exit(1);
+        }
+        body["scope_tag"] = serde_json::json!(tag);
+    }
 
     let vc = VaultClient::from_auth(&auth);
-    vc.post_json("/items", &body);
+    let response: serde_json::Value = vc.post_json("/items", &body).json().unwrap_or_default();
 
     eprintln!("Secret '{}' stored.", label);
+    // Echoed from the server when the caller passed --scope; closes the
+    // verify-on-write loop for the #7 revocation-cascade tag. Client-side
+    // revalidation (same rule the server enforced) guards against a
+    // misbehaving server smuggling terminal escape sequences through the
+    // echoed string — see the matching note in `cmd/apikey.rs`.
+    if let Some(tag) = response["scope_tag"]
+        .as_str()
+        .filter(|t| vault_core::validate_scope_tag(t).is_ok())
+    {
+        eprintln!("Scope tag: {tag}");
+    }
 }
 
 pub fn run_get(
