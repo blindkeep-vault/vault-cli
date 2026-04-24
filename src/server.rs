@@ -571,14 +571,27 @@ async fn create_grant(
 ) -> Result<(StatusCode, Json<crate::db::GrantRow>), ApiError> {
     auth::check_write_allowed(&claims)?;
 
+    // Parse the policy up front so the classification rule runs before we
+    // touch the DB, matching vault-api (#50).
+    let request_policy: vault_core::Policy = serde_json::from_value(body.policy.clone())
+        .map_err(|e| vault_core::error::ApiError::BadRequest(format!("invalid policy: {e}")))?;
+
     let item_id = body.item_id.map(|id| id.to_string());
 
-    // Verify grantor owns the item
     if let Some(ref iid) = item_id {
-        state
+        let item = state
             .db
             .get_item(iid, &claims.sub.to_string())?
             .ok_or(vault_core::error::ApiError::NotFound)?;
+
+        let classification: vault_core::Classification =
+            item.classification.parse().map_err(|_| {
+                vault_core::error::ApiError::Internal(format!(
+                    "invalid classification: {}",
+                    item.classification
+                ))
+            })?;
+        vault_core::policy::classification::enforce_grant_policy(classification, &request_policy)?;
     }
 
     // Resolve grantee
@@ -818,4 +831,183 @@ async fn shutdown_signal() {
         .await
         .expect("failed to listen for ctrl+c");
     eprintln!("\nShutting down...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt as _;
+    use tower::util::ServiceExt;
+
+    fn mk_state(jwt_secret: &str) -> (AppState, tempfile::TempDir, Uuid) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("vault.db")).unwrap();
+        let user_id = Uuid::new_v4();
+        db.create_user(
+            &user_id.to_string(),
+            "u@example.com",
+            "auth-hash",
+            &[0u8; 32],
+            &[0u8; 32],
+            None,
+            &[0u8; 16],
+        )
+        .unwrap();
+        let state = Arc::new(ServerState {
+            db,
+            jwt_secret: jwt_secret.to_string(),
+        });
+        (state, dir, user_id)
+    }
+
+    fn insert_item(state: &AppState, owner_id: Uuid, classification: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        state
+            .db
+            .create_item(
+                &id,
+                &owner_id.to_string(),
+                "",
+                &[0u8],
+                &[0u8],
+                "encrypted",
+                classification,
+                &json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+        id
+    }
+
+    async fn post_grant(
+        app: Router,
+        token: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/grants")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = if bytes.is_empty() {
+            json!(null)
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(json!(null))
+        };
+        (status, value)
+    }
+
+    fn grant_body(item_id: &str, one_shot: bool) -> serde_json::Value {
+        json!({
+            "item_id": item_id,
+            "grantee_email": "grantee@example.com",
+            "wrapped_key": [0u8],
+            "ephemeral_pubkey": [0u8],
+            "policy": { "one_shot": one_shot },
+            "file_wrapped_key": null,
+        })
+    }
+
+    #[tokio::test]
+    async fn create_grant_rejects_confidential_without_one_shot() {
+        let secret = "test-secret";
+        let (state, _dir, user_id) = mk_state(secret);
+        let item_id = insert_item(&state, user_id, "confidential");
+        let token = auth::encode_jwt(user_id, "u@example.com", true, secret).unwrap();
+
+        let app = build_router(state);
+        let (status, body) = post_grant(app, &token, grant_body(&item_id, false)).await;
+
+        // vault-core maps PolicyDenied to 422 Unprocessable Entity; vault-cli's
+        // IntoResponse reuses that mapping, so parity with vault-api is implicit.
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let msg = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("confidential") && msg.contains("one_shot"),
+            "unexpected error body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_grant_allows_confidential_with_one_shot() {
+        let secret = "test-secret";
+        let (state, _dir, user_id) = mk_state(secret);
+        let item_id = insert_item(&state, user_id, "confidential");
+        let token = auth::encode_jwt(user_id, "u@example.com", true, secret).unwrap();
+
+        let app = build_router(state);
+        let (status, _) = post_grant(app, &token, grant_body(&item_id, true)).await;
+
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn create_grant_allows_standard_without_one_shot() {
+        let secret = "test-secret";
+        let (state, _dir, user_id) = mk_state(secret);
+        let item_id = insert_item(&state, user_id, "standard");
+        let token = auth::encode_jwt(user_id, "u@example.com", true, secret).unwrap();
+
+        let app = build_router(state);
+        let (status, _) = post_grant(app, &token, grant_body(&item_id, false)).await;
+
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // Guards against an accidental narrowing of `requires_protected_grant`
+    // (e.g. `matches!(c, Classification::Confidential)`) that would let the
+    // Restricted branch slip through silently.
+    #[tokio::test]
+    async fn create_grant_rejects_restricted_without_one_shot() {
+        let secret = "test-secret";
+        let (state, _dir, user_id) = mk_state(secret);
+        let item_id = insert_item(&state, user_id, "restricted");
+        let token = auth::encode_jwt(user_id, "u@example.com", true, secret).unwrap();
+
+        let app = build_router(state);
+        let (status, body) = post_grant(app, &token, grant_body(&item_id, false)).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let msg = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("restricted") && msg.contains("one_shot"),
+            "unexpected error body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_grant_rejects_malformed_policy_json() {
+        let secret = "test-secret";
+        let (state, _dir, user_id) = mk_state(secret);
+        let item_id = insert_item(&state, user_id, "standard");
+        let token = auth::encode_jwt(user_id, "u@example.com", true, secret).unwrap();
+
+        let body = json!({
+            "item_id": item_id,
+            "grantee_email": "grantee@example.com",
+            "wrapped_key": [0u8],
+            "ephemeral_pubkey": [0u8],
+            // Policy must be an object; a string fails `from_value::<Policy>`.
+            "policy": "not-an-object",
+            "file_wrapped_key": null,
+        });
+
+        let app = build_router(state);
+        let (status, resp) = post_grant(app, &token, body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = resp.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("invalid policy"),
+            "unexpected error body: {resp}"
+        );
+    }
 }
