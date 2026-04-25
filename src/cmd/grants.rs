@@ -83,6 +83,24 @@ pub fn run_grant_create(
 
     let vc = VaultClient::new(effective_url, jwt);
 
+    // Event-log target arm (issue #94). `log/<name>` resolves to the log's
+    // UUID and short-circuits the item key-wrap dance: event logs carry no
+    // per-grant key material, so the grant is a pure capability handoff.
+    if let Some(log_name) = label.strip_prefix("log/") {
+        run_grant_create_event_log(
+            &vc,
+            log_name,
+            to_email,
+            max_views,
+            expires,
+            read_only,
+            one_shot,
+            notarize_on_use,
+            scope_tag,
+        );
+        return;
+    }
+
     // Find the item by label
     let secrets = fetch_and_decrypt_secrets(client, &auth);
     let (item_id, _, _) = secrets
@@ -194,6 +212,97 @@ pub fn run_grant_create(
     // revalidation (same rule the server enforced) guards against a
     // misbehaving server smuggling terminal escape sequences through the
     // echoed string — see the matching note in `cmd/apikey.rs`.
+    if let Some(tag) = body["scope_tag"]
+        .as_str()
+        .filter(|t| vault_core::validate_scope_tag(t).is_ok())
+    {
+        eprintln!("Scope tag: {tag}");
+    }
+}
+
+/// Issue an event-log grant (issue #94). Resolves `<log_name>` to the
+/// log's UUID via `GET /event-logs`, then POSTs a target-`event_log_id`
+/// grant with empty `wrapped_key` / `ephemeral_pubkey` — event logs have
+/// no per-grant key material to deliver. Policy options (max_views,
+/// one_shot, notarize_on_use, expires) flow through unchanged; the
+/// `read_only` flag toggles the `allowed_ops` array the same way as
+/// item grants for consistency, even though `download` is moot for logs.
+#[allow(clippy::too_many_arguments)]
+fn run_grant_create_event_log(
+    vc: &VaultClient,
+    log_name: &str,
+    to_email: &str,
+    max_views: Option<u32>,
+    expires: Option<&str>,
+    read_only: bool,
+    one_shot: bool,
+    notarize_on_use: bool,
+    scope_tag: Option<&str>,
+) {
+    let logs: Vec<serde_json::Value> = vc
+        .get("/event-logs")
+        .json()
+        .expect("invalid /event-logs response");
+    let log_id = logs
+        .iter()
+        .find(|l| l["name"].as_str() == Some(log_name))
+        .and_then(|l| l["id"].as_str())
+        .unwrap_or_else(|| {
+            eprintln!("error: event log '{}' not found", log_name);
+            std::process::exit(1);
+        })
+        .to_string();
+
+    let allowed_ops = if read_only {
+        serde_json::json!(["view"])
+    } else {
+        serde_json::json!(["view", "download"])
+    };
+    let mut policy = serde_json::json!({
+        "allowed_ops": allowed_ops,
+        "notify_on_access": false,
+    });
+    let effective_max_views = max_views.or(if one_shot { Some(1) } else { None });
+    if let Some(n) = effective_max_views {
+        policy["max_views"] = serde_json::json!(n);
+    }
+    if one_shot {
+        policy["one_shot"] = serde_json::json!(true);
+    }
+    if notarize_on_use {
+        policy["notarize_on_use"] = serde_json::json!(true);
+    }
+    if let Some(exp) = expires {
+        let duration = parse_duration(exp).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        });
+        let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
+        policy["expires_at"] = serde_json::json!(expires_at);
+    }
+
+    let mut req_body = serde_json::json!({
+        "event_log_id": log_id,
+        "grantee_email": to_email,
+        "wrapped_key": Vec::<u8>::new(),
+        "ephemeral_pubkey": Vec::<u8>::new(),
+        "policy": policy,
+    });
+    if let Some(tag) = scope_tag {
+        if let Err(e) = vault_core::validate_scope_tag(tag) {
+            eprintln!("error: invalid --scope: {e}");
+            std::process::exit(1);
+        }
+        req_body["scope_tag"] = serde_json::json!(tag);
+    }
+
+    let body: serde_json::Value = vc
+        .post_json("/grants", &req_body)
+        .json()
+        .unwrap_or_default();
+    let grant_id = body["id"].as_str().unwrap_or("(unknown)");
+    eprintln!("Grant created: log/{} -> {}", log_name, to_email);
+    eprintln!("Grant ID: {}", grant_id);
     if let Some(tag) = body["scope_tag"]
         .as_str()
         .filter(|t| vault_core::validate_scope_tag(t).is_ok())
