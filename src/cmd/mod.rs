@@ -12,6 +12,7 @@ pub mod grants;
 pub mod groups;
 pub mod http;
 pub mod inbox;
+pub mod log;
 pub mod notarize;
 pub mod secrets;
 pub mod tombstone;

@@ -221,6 +221,14 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: WatchdogAction,
     },
+    /// Signed, append-only event log (issue #3). Tamper-evident audit trail
+    /// for arbitrary structured events; each append produces a Merkle leaf
+    /// in the same tree as `notarize`, so inclusion proofs are verifiable
+    /// offline against the same RFC 3161-anchored roots.
+    Log {
+        #[command(subcommand)]
+        action: LogAction,
+    },
     /// Organize items into groups
     Group {
         #[command(subcommand)]
@@ -642,6 +650,81 @@ pub(crate) enum WatchdogAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum LogAction {
+    /// Create a new event log.
+    Create {
+        /// Log name. 1–100 chars, unique within the caller's account.
+        name: String,
+        /// Optional JSON Schema URI. v0 is hint-only (clients may use it
+        /// to validate locally); the server does not enforce the schema.
+        #[arg(long)]
+        schema_uri: Option<String>,
+        /// Hex-encoded Ed25519 verifying key (32 bytes). When set, every
+        /// `log append` to this log must carry a matching `--sig`.
+        #[arg(long)]
+        signing_pubkey: Option<String>,
+        /// Per-(API key, log) appends-per-minute cap. Default 1000.
+        #[arg(long)]
+        rate: Option<i32>,
+    },
+    /// List all event logs visible to the caller.
+    List,
+    /// Append an event to a log. Returns `(seq, tree_index, tree_root)` —
+    /// `seq` is printed on stdout for pipeline use; the rest is on stderr.
+    Append {
+        /// Log name.
+        name: String,
+        /// Event JSON: literal string, `@path` for a file, or stdin if absent.
+        #[arg(long)]
+        event: Option<String>,
+        /// Hex-encoded Ed25519 signature over the canonical-JSON event
+        /// bytes. Required when the log was created with `--signing-pubkey`.
+        #[arg(long)]
+        sig: Option<String>,
+        /// Save an inclusion-proof certificate to `event-<log8>-<seq>.json`.
+        #[arg(long)]
+        save_cert: bool,
+    },
+    /// List entries in a log (paginated by seq).
+    Entries {
+        /// Log name.
+        name: String,
+        /// Lower bound on seq, inclusive. Default 1.
+        #[arg(long)]
+        from: Option<i64>,
+        /// Upper bound on seq, inclusive. Default unbounded.
+        #[arg(long)]
+        to: Option<i64>,
+        /// Page size (1..=1000). Default 100.
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    /// Verify a contiguous range of entries: fetch each inclusion-proof
+    /// certificate, recompute the leaf hash locally, run `verify_inclusion`
+    /// offline, and check Ed25519 signatures. Exits non-zero on any failure.
+    Verify {
+        /// Log name.
+        name: String,
+        /// Lower bound on seq, inclusive.
+        #[arg(long)]
+        from: i64,
+        /// Upper bound on seq, inclusive.
+        #[arg(long)]
+        to: i64,
+    },
+    /// Delete a log. Existing inclusion-proof certificates remain valid
+    /// against historical Merkle roots, but the server will no longer
+    /// answer queries for this log's entries.
+    Delete {
+        /// Log name.
+        name: String,
+        /// Skip the typed-name confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum GroupAction {
     /// Create a new group
     Create {
@@ -973,6 +1056,47 @@ fn main() {
         Some(Command::Watchdog { action }) => {
             cmd::watchdog::run_watchdog(&client, &cli.api_url, action);
         }
+        Some(Command::Log { action }) => match action {
+            LogAction::Create {
+                name,
+                schema_uri,
+                signing_pubkey,
+                rate,
+            } => cmd::log::run_create(
+                &client,
+                &cli.api_url,
+                &name,
+                schema_uri.as_deref(),
+                signing_pubkey.as_deref(),
+                rate,
+            ),
+            LogAction::List => cmd::log::run_list(&client, &cli.api_url),
+            LogAction::Append {
+                name,
+                event,
+                sig,
+                save_cert,
+            } => cmd::log::run_append(
+                &client,
+                &cli.api_url,
+                &name,
+                event.as_deref(),
+                sig.as_deref(),
+                save_cert,
+            ),
+            LogAction::Entries {
+                name,
+                from,
+                to,
+                limit,
+            } => cmd::log::run_entries(&client, &cli.api_url, &name, from, to, limit),
+            LogAction::Verify { name, from, to } => {
+                cmd::log::run_verify(&client, &cli.api_url, &name, from, to)
+            }
+            LogAction::Delete { name, yes } => {
+                cmd::log::run_delete(&client, &cli.api_url, &name, yes)
+            }
+        },
         Some(Command::Group { action }) => {
             cmd::groups::run_group(&client, &cli.api_url, action);
         }
