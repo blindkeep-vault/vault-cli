@@ -441,7 +441,7 @@ pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key
 
     let km = if is_scoped {
         let (privkey, pubkey) = generate_x25519_keypair();
-        let wrapped_privkey = wrap_master_key(&wrapping_key, &MasterKey::from_bytes(privkey))
+        let wrapped_privkey = wrap_master_key(&wrapping_key, &MasterKey::from_bytes(*privkey))
             .unwrap_or_else(|e| {
                 eprintln!("error wrapping private key: {}", e);
                 std::process::exit(1);
@@ -450,7 +450,7 @@ pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key
             wrapped_master_key: None,
             encrypted_private_key: wrapped_privkey,
             public_key: Some(pubkey.to_vec()),
-            new_privkey: Some(privkey),
+            new_privkey: Some(*privkey),
         }
     } else {
         let password = prompt_password("Password (to wrap master key): ");
