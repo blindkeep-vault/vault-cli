@@ -51,7 +51,7 @@ pub fn run_apikey_create(
 
     #[allow(clippy::type_complexity)]
     let (secret, key_prefix, auth_key_hex, wrapped_master_key, encrypted_private_key, public_key): (
-        [u8; 32],
+        vault_core::Zeroizing<[u8; 32]>,
         String,
         String,
         Option<Vec<u8>>,
@@ -139,11 +139,17 @@ pub fn run_apikey_create(
         .post_json("/api-keys", &body)
         .json()
         .expect("invalid JSON");
-    let display_key = format!(
-        "vk_{}_{}",
-        hex::encode(&secret[..4]),
-        URL_SAFE_NO_PAD.encode(secret)
-    );
+    // Build into a Zeroizing<String> so the encoded secret wipes on drop.
+    // encode_string appends in place, avoiding the intermediate String that
+    // URL_SAFE_NO_PAD.encode() would otherwise leak on the heap. Capacity
+    // sized for the full output ("vk_" + 8 hex + "_" + 43 base64 = 55) to
+    // avoid a reallocation mid-build.
+    let mut display_key: vault_core::Zeroizing<String> =
+        vault_core::Zeroizing::new(String::with_capacity(64));
+    display_key.push_str("vk_");
+    display_key.push_str(&hex::encode(&secret[..4]));
+    display_key.push('_');
+    URL_SAFE_NO_PAD.encode_string(secret.as_slice(), &mut display_key);
 
     eprintln!();
     eprintln!("API key created: {}", result["name"].as_str().unwrap_or(""));
@@ -176,9 +182,9 @@ pub fn run_apikey_create(
     eprintln!();
     eprintln!("Key (shown once — store it securely):");
     eprintln!();
-    println!("{}", display_key);
+    println!("{}", display_key.as_str());
     eprintln!();
-    eprintln!("Usage: export VAULT_API_KEY={}", display_key);
+    eprintln!("Usage: export VAULT_API_KEY={}", display_key.as_str());
 }
 
 pub fn run_apikey_list(api_url: &str) {
@@ -422,8 +428,8 @@ pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key
     eprintln!("Rotating API key: {} ({})", old_name, old_id);
 
     // Generate new secret
-    let mut secret = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut secret);
+    let mut secret = vault_core::Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut *secret);
 
     let (wrapping_key, auth_key) = derive_api_key_keys(&secret).unwrap_or_else(|e| {
         eprintln!("error: {}", e);
@@ -436,7 +442,6 @@ pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key
         wrapped_master_key: Option<Vec<u8>>,
         encrypted_private_key: Vec<u8>,
         public_key: Option<Vec<u8>>,
-        new_privkey: Option<[u8; 32]>,
     }
 
     let km = if is_scoped {
@@ -450,7 +455,6 @@ pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key
             wrapped_master_key: None,
             encrypted_private_key: wrapped_privkey,
             public_key: Some(pubkey.to_vec()),
-            new_privkey: Some(*privkey),
         }
     } else {
         let password = prompt_password("Password (to wrap master key): ");
@@ -478,7 +482,6 @@ pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key
             wrapped_master_key: Some(wmk),
             encrypted_private_key: epk,
             public_key: None,
-            new_privkey: None,
         }
     };
 
@@ -511,15 +514,8 @@ pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key
             std::process::exit(1);
         });
 
-        // Get old key's private key to unwrap grants
-        // We need the old API key's private key. The user doesn't have the old secret anymore
-        // if they're rotating, so we need the master key to re-wrap from source items.
-        let password = if km.new_privkey.is_some() {
-            // Already prompted for scoped path — need master key for item access
-            prompt_password("Password (to re-grant items): ")
-        } else {
-            unreachable!()
-        };
+        // We need the master key to re-wrap items from source for the new API key.
+        let password = prompt_password("Password (to re-grant items): ");
         let login = vault_core::client::prepare_login(&password, &session.client_salt)
             .unwrap_or_else(|e| {
                 eprintln!("error: {}", e);
@@ -588,19 +584,25 @@ pub fn run_apikey_rotate(_client: &reqwest::blocking::Client, api_url: &str, key
         );
     }
 
-    let display_key = format!(
-        "vk_{}_{}",
-        hex::encode(&secret[..4]),
-        URL_SAFE_NO_PAD.encode(secret)
-    );
+    // Build into a Zeroizing<String> so the encoded secret wipes on drop.
+    // encode_string appends in place, avoiding the intermediate String that
+    // URL_SAFE_NO_PAD.encode() would otherwise leak on the heap. Capacity
+    // sized for the full output ("vk_" + 8 hex + "_" + 43 base64 = 55) to
+    // avoid a reallocation mid-build.
+    let mut display_key: vault_core::Zeroizing<String> =
+        vault_core::Zeroizing::new(String::with_capacity(64));
+    display_key.push_str("vk_");
+    display_key.push_str(&hex::encode(&secret[..4]));
+    display_key.push('_');
+    URL_SAFE_NO_PAD.encode_string(secret.as_slice(), &mut display_key);
 
     eprintln!();
     eprintln!("Rotated: {} -> {}", old_id, new_id);
     eprintln!("New key (shown once — store it securely):");
     eprintln!();
-    println!("{}", display_key);
+    println!("{}", display_key.as_str());
     eprintln!();
-    eprintln!("Usage: export VAULT_API_KEY={}", display_key);
+    eprintln!("Usage: export VAULT_API_KEY={}", display_key.as_str());
 }
 
 // --- Grant commands ---

@@ -327,7 +327,14 @@ async fn auth_api_key(
             user_id: user_id.clone(),
             api_key_id: key_id.clone(),
             wrapped_master_key: wrapped_master_key.clone(),
+            // vault-cli's SQLite schema doesn't track per-row
+            // format_version (no V0 history to backfill — the serve
+            // binary postdates V1). Phase 2 of #122; the constant `1`
+            // matches the steady state and the wire shape vault-api
+            // sends.
+            wrapped_master_key_format_version: 1,
             encrypted_private_key: encrypted_private_key.clone(),
+            encrypted_private_key_format_version: 1,
             public_key: public_key.clone(),
         }));
     }

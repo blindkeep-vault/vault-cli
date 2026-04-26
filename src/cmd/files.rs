@@ -139,7 +139,7 @@ pub fn run_file_get(
     let items: Vec<serde_json::Value> = vc.get("/items").json().expect("invalid JSON");
 
     // Find matching file item and keep its item_key
-    let mut found: Option<(String, SecretBlob, [u8; 32])> = None;
+    let mut found: Option<(String, SecretBlob, vault_core::Zeroizing<[u8; 32]>)> = None;
     for item in &items {
         let item_id = item["id"].as_str().unwrap_or("").to_string();
         let wrapped_key = json_to_bytes(&item["wrapped_key"]);
@@ -174,8 +174,11 @@ pub fn run_file_get(
                 Err(_) => continue,
             };
 
-        // Envelope may be padded (web UI pads it)
-        let envelope_bytes = unpad(&decrypted);
+        // Envelope may be padded (web UI pads it) or raw (legacy V0). Try
+        // unpad first; on failure fall through to the raw bytes so legacy
+        // unpadded envelopes still match. Tampered V1 prefixes slip through
+        // here as garbage that fails JSON parse — accepted (#129 L-1).
+        let envelope_bytes = unpad(&decrypted).unwrap_or(&decrypted[..]);
 
         let Ok(blob) = serde_json::from_slice::<SecretBlob>(envelope_bytes) else {
             continue;
@@ -222,8 +225,10 @@ pub fn run_file_get(
             std::process::exit(1);
         });
 
-    // Unpad to get original file bytes
-    let file_bytes = unpad(&decrypted);
+    // Unpad to get original file bytes; legacy V0 file blobs were stored
+    // un-padded, so fall through to the raw decrypted bytes on prefix
+    // failure. Tampered V1 prefix → garbage file (#129 L-1, residual).
+    let file_bytes = unpad(&decrypted).unwrap_or(&decrypted[..]);
 
     // Determine output path
     let out_path =

@@ -42,7 +42,7 @@ fn build_will_payload(
     let filter_labels: Option<Vec<&str>> = items_filter.map(|f| f.split(',').collect());
 
     // Decrypt item names to match against filter
-    let mut selected_items: Vec<(String, [u8; 32])> = Vec::new();
+    let mut selected_items: Vec<(String, vault_core::Zeroizing<[u8; 32]>)> = Vec::new();
     for item in &all_items {
         let item_id = item["id"].as_str().unwrap_or("").to_string();
         let wrapped_key = json_to_bytes(&item["wrapped_key"]);
@@ -97,7 +97,7 @@ fn build_will_payload(
         .iter()
         .map(|(id, key)| vault_core::client::WillItemKey {
             item_id: id.clone(),
-            item_key: *key,
+            item_key: key.clone(),
         })
         .collect();
 

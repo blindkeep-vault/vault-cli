@@ -572,11 +572,12 @@ pub fn run_grant_create_link(
     };
 
     // Use consolidated link-secret grant preparation
-    let lg =
-        vault_core::client::prepare_link_grant(&item_key, file_key.as_ref()).unwrap_or_else(|e| {
+    let lg = vault_core::client::prepare_link_grant(&item_key, file_key.as_deref()).unwrap_or_else(
+        |e| {
             eprintln!("error preparing link grant: {}", e);
             std::process::exit(1);
-        });
+        },
+    );
 
     // Build policy
     let allowed_ops = if read_only {

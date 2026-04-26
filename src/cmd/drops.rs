@@ -94,7 +94,10 @@ pub fn download_drop(api_url: &str, drop_id: &str, key: &[u8; 32], output: Optio
             std::process::exit(1);
         });
 
-    let plain = unpad(&padded);
+    let plain = unpad(&padded).unwrap_or_else(|e| {
+        eprintln!("error: unpad failed: {}", e);
+        std::process::exit(1);
+    });
     let (filename, file_data) = parse_envelope(plain, drop_id);
 
     let out_path = output.unwrap_or_else(|| PathBuf::from(&filename));

@@ -31,7 +31,8 @@ pub use std::io::{Read as IoRead, Write};
 pub use std::path::PathBuf;
 pub use vault_core::crypto::{
     derive_api_key_keys, derive_master_key, derive_subkey, generate_x25519_keypair,
-    unwrap_grant_key, unwrap_key, unwrap_master_key, wrap_master_key, MasterKey,
+    unwrap_grant_key, unwrap_key, unwrap_key_v1, unwrap_master_key, wrap_master_key,
+    x25519_pubkey_from_privkey, MasterKey,
 };
 pub use vault_core::drops::{
     derive_drop_lookup_key, derive_drop_wrapping_key, generate_bip39_mnemonic, unwrap_drop_key,

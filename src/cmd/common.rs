@@ -387,7 +387,16 @@ pub fn fetch_secrets_scoped(
         .json()
         .expect("invalid JSON");
 
+    // Pre-derive the API key's own X25519 public key once. The V1 unwrap
+    // path needs it to reconstruct the key-bound HKDF salt
+    // (`eph_pub‖recipient_pub`) and AAD. The V0 path doesn't, but deriving
+    // unconditionally is cheaper than a per-grant branch and keeps the
+    // loop body uniform.
+    let api_pubkey = x25519_pubkey_from_privkey(api_privkey);
+
     let mut secrets = Vec::new();
+    let mut skipped_unwrap = 0usize;
+    let mut skipped_unknown_version = 0usize;
     for grant in &grants {
         let item_id = grant["item_id"].as_str().unwrap_or("").to_string();
         let wrapped_key = json_to_bytes(&grant["wrapped_key"]);
@@ -398,15 +407,52 @@ pub fn fetch_secrets_scoped(
             _ => continue,
         };
 
-        // Unwrap item key using API key's private key via X25519 DH
-        let item_key = match unwrap_key(api_privkey, &eph_pub, &wrapped_key, &nonce) {
-            Ok(k) => k,
-            Err(_) => continue,
+        // Dispatch on the per-row `format_version` the server returns. New
+        // emitters write `1`; legacy rows still exist as `0`. Default to 0
+        // if the field is missing — matches the SQL default on
+        // `api_key_grants.format_version`.
+        let format_version = grant
+            .get("format_version")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let item_key = match format_version {
+            1 => match unwrap_key_v1(api_privkey, &eph_pub, &wrapped_key, &nonce, &api_pubkey) {
+                Ok(k) => k,
+                Err(_) => {
+                    skipped_unwrap += 1;
+                    continue;
+                }
+            },
+            0 => match unwrap_key(api_privkey, &eph_pub, &wrapped_key, &nonce) {
+                Ok(k) => k,
+                Err(_) => {
+                    skipped_unwrap += 1;
+                    continue;
+                }
+            },
+            _ => {
+                skipped_unknown_version += 1;
+                continue;
+            }
         };
 
         if let Some(blob) = decrypt_item_blob(client, api_url, jwt, &item_id, &item_key, "") {
             secrets.push((item_id, blob, String::new()));
         }
+    }
+
+    if skipped_unwrap > 0 {
+        eprintln!(
+            "warning: {} api-key grant(s) could not be unwrapped (key mismatch, tamper, or corruption)",
+            skipped_unwrap
+        );
+    }
+    if skipped_unknown_version > 0 {
+        eprintln!(
+            "warning: {} api-key grant(s) skipped due to unknown format_version (CLI may be out of date)",
+            skipped_unknown_version
+        );
     }
 
     secrets
