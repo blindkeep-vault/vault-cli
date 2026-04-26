@@ -275,8 +275,8 @@ pub fn run_verify(
         };
 
         let payload_hash_hex = cert["entry"]["payload_hash"].as_str().unwrap_or("");
-        let payload_hash = match hex::decode(payload_hash_hex) {
-            Ok(b) if b.len() == 32 => b,
+        let payload_hash: [u8; 32] = match hex::decode(payload_hash_hex) {
+            Ok(b) if b.len() == 32 => b.as_slice().try_into().unwrap(),
             _ => {
                 eprintln!("seq={seq} [FAIL] cert has invalid payload_hash");
                 all_pass = false;
@@ -313,16 +313,14 @@ pub fn run_verify(
         let sig = STANDARD.decode(sig_b64).unwrap_or_default();
         let key_b64 = cert["signing_key"].as_str().unwrap_or("");
         let key = STANDARD.decode(key_b64).unwrap_or_default();
-        let sig_ok = if sig.len() == 64 && key.len() == 32 && payload_hash.len() == 32 {
+        let sig_ok = if sig.len() == 64 && key.len() == 32 {
             let mut pk = [0u8; 32];
             pk.copy_from_slice(&key);
             let mut s = [0u8; 64];
             s.copy_from_slice(&sig);
-            let mut ph = [0u8; 32];
-            ph.copy_from_slice(&payload_hash);
             vault_core::crypto::verify_notarization_signature(
                 &pk,
-                &ph,
+                &payload_hash,
                 None,
                 timestamp_ms,
                 &tree_root,
